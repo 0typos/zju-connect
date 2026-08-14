@@ -324,13 +324,23 @@ fn tunnel_status(status: [u8; 2]) -> String {
 async fn bridge_frames(tls: TlsStream<TcpStream>, bridge: DuplexStream) -> Result<(), Error> {
     let (tls_read, tls_write) = tokio::io::split(tls);
     let (app_read, app_write) = tokio::io::split(bridge);
-    // The server→application direction owns connection lifetime: when the
-    // application half-closes, keep draining the server until it closes too,
-    // so in-flight response data is never dropped.
-    let uplink = tokio::spawn(application_to_tunnel(app_read, tls_write));
-    let result = tunnel_to_application(tls_read, app_write).await;
-    uplink.abort();
-    result
+    let uplink = application_to_tunnel(app_read, tls_write);
+    let downlink = tunnel_to_application(tls_read, app_write);
+    tokio::pin!(uplink, downlink);
+    let mut uplink_done = false;
+    loop {
+        tokio::select! {
+            // The server→application direction owns connection lifetime.
+            result = &mut downlink => return result,
+            // A clean application half-close keeps the server draining so
+            // in-flight response data is never dropped; an uplink *error*
+            // tears the bridge down instead of hanging until the server acts.
+            result = &mut uplink, if !uplink_done => match result {
+                Ok(()) => uplink_done = true,
+                Err(error) => return Err(error),
+            },
+        }
+    }
 }
 
 async fn application_to_tunnel<R, W>(mut app: R, mut tls: W) -> Result<(), Error>

@@ -37,6 +37,9 @@ const NODE_RETRY_COOLDOWN: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const FLOW_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to suppress re-authorization for a destination the gateway just
+/// rejected, so a chatty denied flow cannot become a per-packet request storm.
+const REJECT_COOLDOWN: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct L3Settings {
@@ -296,9 +299,12 @@ async fn forward_outbound_packet(
             tracing::trace!(group, "dropping packet: node queue is full");
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            tracing::debug!(group, "aTrust node connection closed; scheduling reconnect");
+            // The node task has already ended; drop the stale handle and clear
+            // any cooldown so the next packet reopens it at once (the cooldown
+            // exists to rate-limit failed *opens*, not confirmed-dead nodes).
+            tracing::debug!(group, "aTrust node connection closed; reconnecting");
             nodes.remove(&group);
-            node_failures.insert(group, tokio::time::Instant::now());
+            node_failures.remove(&group);
         }
     }
 }
@@ -491,6 +497,7 @@ where
 
     let mut flows = HashMap::<FlowKey, Flow>::new();
     let mut auth_flows = HashMap::<u64, FlowKey>::new();
+    let mut rejected = HashMap::<FlowKey, tokio::time::Instant>::new();
     let mut next_auth_id = 0_u64;
     let mut incoming_bytes = Vec::new();
     let mut outstanding_heartbeats = 0_u32;
@@ -510,6 +517,7 @@ where
                     command,
                     &mut flows,
                     &mut auth_flows,
+                    &mut rejected,
                     &mut next_auth_id,
                 ).await {
                     break Err(error);
@@ -523,6 +531,10 @@ where
                     Ok(frame) => frame,
                     Err(error) => break Err(error),
                 };
+                // Any inbound frame proves the peer is alive, so it clears the
+                // heartbeat-miss counter — a node actively streaming data but
+                // deprioritizing heartbeat replies must not be killed.
+                outstanding_heartbeats = 0;
                 match frame {
                     Frame::Data(data) => {
                         incoming_bytes.extend_from_slice(&data);
@@ -539,6 +551,7 @@ where
                             &payload,
                             &mut flows,
                             &mut auth_flows,
+                            &mut rejected,
                         ).await {
                             break Err(error);
                         }
@@ -546,10 +559,8 @@ where
                     Frame::VipUpdate { status, payload } => {
                         handle_vip_update(status, &payload, settings.expected_vip);
                     }
-                    Frame::Heartbeat => {
-                        outstanding_heartbeats = 0;
-                    }
-                    Frame::Other => {}
+                    // Liveness already cleared above for every inbound frame.
+                    Frame::Heartbeat | Frame::Other => {}
                 }
             }
             _ = heartbeat.tick() => {
@@ -623,20 +634,35 @@ async fn process_command<W>(
     command: PacketCommand,
     flows: &mut HashMap<FlowKey, Flow>,
     auth_flows: &mut HashMap<u64, FlowKey>,
+    rejected: &mut HashMap<FlowKey, tokio::time::Instant>,
     next_auth_id: &mut u64,
 ) -> Result<(), Error>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     if let Some(flow) = flows.get_mut(&command.meta.key) {
-        flow.last_activity = tokio::time::Instant::now();
         if let Some(token) = flow.token.clone() {
+            // Only refresh liveness for authorized flows. A flow still
+            // awaiting authorization must keep its original timestamp so the
+            // FLOW_AUTH_TIMEOUT backstop can evict it (and force a fresh
+            // authorization) even under steady traffic, rather than
+            // black-holing every packet forever when an auth reply is lost.
+            flow.last_activity = tokio::time::Instant::now();
             return write_data_packet(tls, &token, &command.packet).await;
         }
         if flow.pending.len() < MAX_PENDING_PACKETS {
             flow.pending.push(command.packet);
         }
         return Ok(());
+    }
+
+    // Suppress re-authorization for a recently rejected destination.
+    match rejected.get(&command.meta.key) {
+        Some(at) if at.elapsed() < REJECT_COOLDOWN => return Ok(()),
+        Some(_) => {
+            rejected.remove(&command.meta.key);
+        }
+        None => {}
     }
 
     *next_auth_id = next_auth_id.wrapping_add(1).max(1);
@@ -681,6 +707,7 @@ async fn process_authentication_response<W>(
     payload: &[u8],
     flows: &mut HashMap<FlowKey, Flow>,
     auth_flows: &mut HashMap<u64, FlowKey>,
+    rejected: &mut HashMap<FlowKey, tokio::time::Instant>,
 ) -> Result<(), Error>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -705,8 +732,9 @@ where
             status,
             code = response.code,
             message = %response.message,
-            "aTrust flow authorization rejected; the flow will retry on new traffic"
+            "aTrust flow authorization rejected; suppressing re-auth briefly"
         );
+        rejected.insert(key, tokio::time::Instant::now());
         return Ok(());
     }
     let token = if response.data.connect_token.is_empty() {
@@ -1157,14 +1185,16 @@ mod tests {
         ));
 
         let packet = ipv4_packet(6, 1000, 443);
-        let meta = parse_packet_meta(&packet).unwrap();
-        let command = || PacketCommand {
-            packet: packet.clone(),
-            meta: meta.clone(),
-            app_id: "app".into(),
+        let command = |packet: &[u8]| {
+            let packet = packet.to_vec();
+            PacketCommand {
+                meta: parse_packet_meta(&packet).unwrap(),
+                packet,
+                app_id: "app".into(),
+            }
         };
 
-        commands_sender.send(command()).await.unwrap();
+        commands_sender.send(command(&packet)).await.unwrap();
         let first = read_auth_request(&mut gateway_read).await;
         assert_eq!(first["conntrackHash"], 1);
 
@@ -1184,8 +1214,10 @@ mod tests {
         gateway_write.write_all(&data_frame).await.unwrap();
         assert_eq!(incoming_receiver.recv().await.unwrap(), inbound);
 
-        // The same 5-tuple retries with a fresh authorization on new traffic.
-        commands_sender.send(command()).await.unwrap();
+        // A different 5-tuple still authorizes normally — the node is alive —
+        // while the rejected flow stays suppressed under REJECT_COOLDOWN.
+        let other = ipv4_packet(6, 2000, 443);
+        commands_sender.send(command(&other)).await.unwrap();
         let second = read_auth_request(&mut gateway_read).await;
         assert_eq!(second["conntrackHash"], 2);
 

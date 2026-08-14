@@ -208,10 +208,15 @@ impl Config {
             ));
         }
         // A bare "host:port" in server_address is a common mistake; the port
-        // belongs in server_port. IPv6 literals legitimately contain colons.
-        if self.server_address.parse::<std::net::Ipv6Addr>().is_err()
-            && self.server_address.contains(':')
-        {
+        // belongs in server_port. IPv6 literals legitimately contain colons,
+        // whether bare (2001:db8::1) or bracketed ([2001:db8::1]).
+        let bare_v6 = self.server_address.parse::<std::net::Ipv6Addr>().is_ok();
+        let bracketed_v6 = self
+            .server_address
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|inner| inner.parse::<std::net::Ipv6Addr>().is_ok());
+        if !bare_v6 && !bracketed_v6 && self.server_address.contains(':') {
             return Err(Error::Config(
                 "server_address must not include a port; set server_port instead".into(),
             ));
@@ -327,10 +332,10 @@ impl Config {
             let Some(bind) = bind.filter(|value| !value.is_empty()) else {
                 continue;
             };
-            let address = bind.parse::<std::net::SocketAddr>().map_err(|_| {
-                Error::Config(format!("{name} must be a valid host:port address: {bind}"))
-            })?;
-            if !address.ip().is_loopback() && !has_credentials && !self.allow_open_proxy {
+            // Hostname binds (e.g. "localhost:1080") are resolved by the
+            // listener at bind time, so accept them here; only require the
+            // open-proxy acknowledgement when the target is not loopback.
+            if bind_exposes_non_loopback(bind) && !has_credentials && !self.allow_open_proxy {
                 return Err(Error::Config(format!(
                     "{name} listens on a non-loopback address ({bind}); set socks_user/socks_password or enable allow_open_proxy to expose the proxy"
                 )));
@@ -346,6 +351,20 @@ impl Config {
             format!("{}:{}", self.server_address, self.server_port)
         }
     }
+}
+
+/// Whether a proxy bind string would expose the proxy beyond loopback. A
+/// parseable socket address is judged by its IP; a hostname bind is treated as
+/// loopback only for the well-known loopback names.
+fn bind_exposes_non_loopback(bind: &str) -> bool {
+    if let Ok(address) = bind.parse::<std::net::SocketAddr>() {
+        return !address.ip().is_loopback();
+    }
+    let host = bind
+        .rsplit_once(':')
+        .map_or(bind, |(host, _)| host)
+        .trim_matches(['[', ']']);
+    !(host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("ip6-localhost"))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -490,6 +509,34 @@ mod tests {
             ..Config::default()
         };
         assert!(atrust_custom.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_hostname_and_bracketed_ipv6_forms() {
+        // localhost hostname bind is treated as loopback and needs no auth.
+        let localhost = Config {
+            socks_bind: Some("localhost:1080".into()),
+            http_bind: None,
+            ..Config::default()
+        };
+        localhost.validate().unwrap();
+
+        // A real hostname bind still requires the open-proxy acknowledgement.
+        let public = Config {
+            socks_bind: Some("proxy.example.edu:1080".into()),
+            http_bind: None,
+            ..Config::default()
+        };
+        assert!(public.validate().is_err());
+
+        // Bracketed and bare IPv6 server addresses are both accepted.
+        for address in ["[2001:db8::1]", "2001:db8::1"] {
+            let config = Config {
+                server_address: address.into(),
+                ..Config::default()
+            };
+            config.validate().unwrap();
+        }
     }
 
     #[test]

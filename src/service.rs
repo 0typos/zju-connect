@@ -75,6 +75,7 @@ pub struct Connector {
     custom_dns: BTreeMap<String, IpAddr>,
     dns_ttl: Duration,
     dns_cache: DnsCache,
+    excluded: Arc<std::collections::HashSet<IpAddr>>,
 }
 
 impl Connector {
@@ -83,6 +84,19 @@ impl Connector {
         dns: DnsConfig,
         interface: impl Into<String>,
         custom_dns: BTreeMap<String, IpAddr>,
+    ) -> Self {
+        Self::with_exclusions(policy, dns, interface, custom_dns, Vec::new())
+    }
+
+    /// Like [`Self::new`], but `excluded` addresses (typically the VPN gateway)
+    /// are always reached directly and never routed into the TUN, so the outer
+    /// VPN transport cannot be captured by a per-connection host route.
+    pub fn with_exclusions(
+        policy: Policy,
+        dns: DnsConfig,
+        interface: impl Into<String>,
+        custom_dns: BTreeMap<String, IpAddr>,
+        excluded: impl IntoIterator<Item = IpAddr>,
     ) -> Self {
         let DnsConfig {
             remote_dns,
@@ -97,6 +111,7 @@ impl Connector {
             custom_dns,
             dns_ttl: ttl,
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
+            excluded: Arc::new(excluded.into_iter().collect()),
         }
     }
 
@@ -110,11 +125,16 @@ impl Connector {
         if self.dns_ttl.is_zero() {
             return;
         }
+        // A pathologically large dns_ttl must not overflow the deadline.
+        let Some(expiry) = Instant::now().checked_add(self.dns_ttl) else {
+            return;
+        };
         if let Ok(mut cache) = self.dns_cache.lock() {
-            cache.insert(
-                host.to_owned(),
-                (addresses.to_vec(), Instant::now() + self.dns_ttl),
-            );
+            // Drop expired entries opportunistically so the map cannot grow
+            // without bound over a long uptime.
+            let now = Instant::now();
+            cache.retain(|_, (_, entry_expiry)| *entry_expiry > now);
+            cache.insert(host.to_owned(), (addresses.to_vec(), expiry));
         }
     }
 
@@ -151,6 +171,12 @@ impl Connector {
     pub async fn connect_tcp(&self, host: &str, port: u16) -> Result<TcpStream, Error> {
         let host = host.trim_matches(['[', ']']);
         if let Ok(address) = host.parse::<IpAddr>() {
+            // An excluded address (the VPN gateway) must reach the underlay
+            // directly; routing its /32 into the TUN would undo the exclusion
+            // and loop the outer transport back through its own tunnel.
+            if self.excluded.contains(&address) {
+                return connect_addresses([SocketAddr::new(address, port)]).await;
+            }
             match self.policy.route_ip(address, port, ProtocolMatch::Tcp) {
                 Route::Vpn => add_host_route(address, &self.interface).await?,
                 Route::Reject => return Err(rejected(&address.to_string())),
@@ -182,8 +208,13 @@ impl Connector {
                     "{normalized} resolved to no IPv4 address reachable over the VPN"
                 )));
             }
+            // Route each address into the TUN, except an excluded gateway
+            // address, which stays on the underlay so the outer transport is
+            // never captured by its own tunnel.
             for address in &addresses {
-                add_host_route(*address, &self.interface).await?;
+                if !self.excluded.contains(address) {
+                    add_host_route(*address, &self.interface).await?;
+                }
             }
         }
         connect_addresses(
@@ -267,15 +298,13 @@ async fn accept(listener: &TcpListener) -> Option<(TcpStream, SocketAddr)> {
     match listener.accept().await {
         Ok(pair) => Some(pair),
         Err(error) => {
-            match error.raw_os_error() {
-                // ECONNABORTED — client vanished mid-handshake.
-                Some(103) => {}
-                // EMFILE/ENFILE — out of descriptors; back off so we don't spin.
-                Some(24 | 23) => {
-                    tracing::warn!(%error, "accept hit a descriptor limit; backing off");
-                    tokio::time::sleep(ACCEPT_BACKOFF).await;
-                }
-                _ => tracing::warn!(%error, "transient accept error"),
+            // ECONNABORTED (client vanished mid-handshake) can retry at once.
+            // Any other error — EMFILE/ENFILE exhaustion, ENOBUFS/ENOMEM, or a
+            // persistent listener fault — can recur immediately, so back off to
+            // avoid spinning at 100% CPU.
+            if error.raw_os_error() != Some(103) {
+                tracing::warn!(%error, "accept error; backing off");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
             }
             None
         }
@@ -552,11 +581,16 @@ fn proxy_auth_ok(header: &str, credentials: Option<&(String, String)>) -> bool {
         let Some((name, value)) = line.split_once(':') else {
             return false;
         };
-        name.trim().eq_ignore_ascii_case("proxy-authorization")
-            && value
-                .trim()
-                .strip_prefix("Basic ")
-                .is_some_and(|token| token.trim() == expected)
+        if !name.trim().eq_ignore_ascii_case("proxy-authorization") {
+            return false;
+        }
+        // The auth-scheme token is case-insensitive per RFC 7235.
+        let value = value.trim();
+        value
+            .split_once(char::is_whitespace)
+            .is_some_and(|(scheme, token)| {
+                scheme.eq_ignore_ascii_case("basic") && token.trim() == expected
+            })
     })
 }
 
@@ -662,18 +696,26 @@ async fn resolve_dns(host: &str, server: IpAddr) -> Result<Vec<IpAddr>, Error> {
                     format!("DNS query to {server} timed out"),
                 ))
             })??;
-        // A response whose ID does not match ours is stale or spoofed; keep
-        // reading until the deadline instead of failing the whole query.
-        match parse_dns_response(id, &response[..length]) {
-            Ok(addresses) if addresses.is_empty() => {
-                return Err(Error::Protocol(format!(
-                    "remote DNS returned no address for {host}"
-                )));
+        // A datagram whose ID does not match ours is stale or spoofed; keep
+        // reading until the deadline. A datagram that DOES match is the
+        // authoritative answer — return it (including an rcode or empty-answer
+        // error) immediately rather than stalling out the timeout.
+        let matches_id = length >= 2 && u16::from_be_bytes([response[0], response[1]]) == id;
+        if !matches_id {
+            if tokio::time::Instant::now() < deadline {
+                continue;
             }
-            Ok(addresses) => return Ok(addresses),
-            Err(_) if tokio::time::Instant::now() < deadline => {}
-            Err(error) => return Err(error),
+            return Err(Error::Protocol(format!(
+                "remote DNS did not answer the query for {host}"
+            )));
         }
+        let addresses = parse_dns_response(id, &response[..length])?;
+        if addresses.is_empty() {
+            return Err(Error::Protocol(format!(
+                "remote DNS returned no address for {host}"
+            )));
+        }
+        return Ok(addresses);
     }
 }
 
@@ -921,6 +963,31 @@ mod tests {
             "unused",
             BTreeMap::new(),
         ))
+    }
+
+    #[tokio::test]
+    async fn excluded_gateway_connects_directly_under_proxy_all() {
+        // proxy_all would route every IPv4 address into the TUN, which for an
+        // excluded gateway would shell out to `ip route replace ... dev unused`
+        // and fail. The exclusion must make the connection go direct instead.
+        let gateway: IpAddr = "127.0.0.1".parse().unwrap();
+        let listener = TcpListener::bind((gateway, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let connector = Connector::with_exclusions(
+            Policy::new(Resources::default(), true),
+            DnsConfig {
+                remote_dns: None,
+                secondary_dns: None,
+                ttl: Duration::ZERO,
+            },
+            "unused",
+            BTreeMap::new(),
+            [gateway],
+        );
+        connector.connect_tcp("127.0.0.1", port).await.unwrap();
+        accept.await.unwrap().unwrap();
     }
 
     async fn echo_server() -> SocketAddr {

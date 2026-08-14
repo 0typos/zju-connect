@@ -347,12 +347,12 @@ async fn run_atrust_tun_services(
         client_ip,
         TunOptions {
             routes,
-            exclude,
+            exclude: exclude.clone(),
             ..TunOptions::default()
         },
     )
     .await?;
-    let connector = Arc::new(Connector::new(
+    let connector = Arc::new(Connector::with_exclusions(
         Policy::new(info.resources.clone(), config.proxy_all),
         dns_config(&config, &info),
         tun.interface(),
@@ -361,6 +361,7 @@ async fn run_atrust_tun_services(
             .iter()
             .map(|entry| (entry.host_name.to_ascii_lowercase(), entry.ip))
             .collect::<BTreeMap<_, _>>(),
+        exclude,
     ));
     let tunnel = tun.run(l3);
     let result = if proxy_enabled {
@@ -537,12 +538,12 @@ async fn run_easyconnect_services(
         client_ip,
         TunOptions {
             routes,
-            exclude,
+            exclude: exclude.clone(),
             ..TunOptions::default()
         },
     )
     .await?;
-    let connector = Arc::new(Connector::new(
+    let connector = Arc::new(Connector::with_exclusions(
         Policy::new(info.resources.clone(), config.proxy_all),
         dns_config(&config, &info),
         tun.interface(),
@@ -551,6 +552,7 @@ async fn run_easyconnect_services(
             .iter()
             .map(|entry| (entry.host_name.to_ascii_lowercase(), entry.ip))
             .collect::<BTreeMap<_, _>>(),
+        exclude,
     ));
     let tunnel = tun.run(l3);
     let result = if proxy_enabled {
