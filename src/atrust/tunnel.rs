@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::{net::IpAddr, time::Duration};
 
 use async_trait::async_trait;
 use hmac::{Hmac, Mac as _};
@@ -20,6 +20,8 @@ use crate::{
 use super::{AtrustClient, split_endpoint};
 
 const MAX_FRAME: usize = 65_535;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[async_trait]
 impl TcpConnector for AtrustClient {
@@ -88,7 +90,10 @@ impl TcpConnector for AtrustClient {
 }
 
 async fn direct_connect(host: &str, port: u16) -> Result<ProxyStream, Error> {
-    Ok(Box::pin(TcpStream::connect((host, port)).await?))
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+        .await
+        .map_err(|_| Error::Protocol(format!("direct connection to {host}:{port} timed out")))??;
+    Ok(Box::pin(stream))
 }
 
 async fn resolve_tunnel_domain(
@@ -130,17 +135,22 @@ fn domain_suffixes(domain: &str) -> impl Iterator<Item = &str> {
 
 async fn open_tls(node: &str) -> Result<TlsStream<TcpStream>, Error> {
     let (host, _) = split_endpoint(node)?;
-    let tcp = TcpStream::connect(node).await?;
-    let connector = NativeTlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .use_sni(false)
-        .build()
-        .map_err(|error| Error::Tls(error.to_string()))?;
-    TlsConnector::from(connector)
-        .connect(host, tcp)
+    let connect = async {
+        let tcp = TcpStream::connect(node).await?;
+        let connector = NativeTlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .use_sni(false)
+            .build()
+            .map_err(|error| Error::Tls(error.to_string()))?;
+        TlsConnector::from(connector)
+            .connect(host, tcp)
+            .await
+            .map_err(|error| Error::Tls(error.to_string()))
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT, connect)
         .await
-        .map_err(|error| Error::Tls(error.to_string()))
+        .map_err(|_| Error::Protocol(format!("aTrust node {node} TLS connect timed out")))?
 }
 
 struct TunnelRequest<'a> {
@@ -198,7 +208,9 @@ async fn open_tcp_tunnel(
     }
     destination_frame.extend_from_slice(&request.port.to_be_bytes());
     tls.write_all(&destination_frame).await?;
-    wait_for_connect(&mut tls, request.skip_wait).await?;
+    tokio::time::timeout(SETUP_TIMEOUT, wait_for_connect(&mut tls, request.skip_wait))
+        .await
+        .map_err(|_| Error::Protocol("aTrust TCP tunnel setup timed out".into()))??;
 
     let (application, bridge) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
@@ -312,10 +324,13 @@ fn tunnel_status(status: [u8; 2]) -> String {
 async fn bridge_frames(tls: TlsStream<TcpStream>, bridge: DuplexStream) -> Result<(), Error> {
     let (tls_read, tls_write) = tokio::io::split(tls);
     let (app_read, app_write) = tokio::io::split(bridge);
-    tokio::select! {
-        result = application_to_tunnel(app_read, tls_write) => result,
-        result = tunnel_to_application(tls_read, app_write) => result,
-    }
+    // The server→application direction owns connection lifetime: when the
+    // application half-closes, keep draining the server until it closes too,
+    // so in-flight response data is never dropped.
+    let uplink = tokio::spawn(application_to_tunnel(app_read, tls_write));
+    let result = tunnel_to_application(tls_read, app_write).await;
+    uplink.abort();
+    result
 }
 
 async fn application_to_tunnel<R, W>(mut app: R, mut tls: W) -> Result<(), Error>
