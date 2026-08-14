@@ -119,10 +119,13 @@ impl TunSession {
             #[allow(unreachable_code)]
             Ok::<(), Error>(())
         };
+        // The caller owns shutdown (a global signal, or a per-connection
+        // cancel in the daemon); this future ends only when a packet stream
+        // fails. Dropping the returned future removes the interface and its
+        // routes, so cancellation needs no cooperation here.
         tokio::select! {
             result = to_vpn => result,
             result = from_vpn => result,
-            result = crate::shutdown_signal() => result,
         }
     }
 }

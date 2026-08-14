@@ -1720,6 +1720,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "sangfordetunz"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "binrw",
+ "clap",
+ "hex",
+ "hmac",
+ "ipnet",
+ "md-5",
+ "native-tls",
+ "pretty_assertions",
+ "rand 0.8.7",
+ "rc4",
+ "reqwest",
+ "roxmltree",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-native-tls",
+ "toml",
+ "totp-rs",
+ "tracing",
+ "tracing-subscriber",
+ "tun",
+ "url",
+ "x509-parser",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2709,42 +2745,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
-]
-
-[[package]]
-name = "zju-connect"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "binrw",
- "clap",
- "hex",
- "hmac",
- "ipnet",
- "md-5",
- "native-tls",
- "pretty_assertions",
- "rand 0.8.7",
- "rc4",
- "reqwest",
- "roxmltree",
- "rsa",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-native-tls",
- "toml",
- "totp-rs",
- "tracing",
- "tracing-subscriber",
- "tun",
- "url",
- "x509-parser",
 ]
 
 [[package]]

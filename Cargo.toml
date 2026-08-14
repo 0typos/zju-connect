@@ -1,20 +1,24 @@
 [package]
-name = "zju-connect"
+name = "sangfordetunz"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Rust library and CLI for Sangfor EasyConnect and aTrust VPNs"
+description = "Rust library, daemon (sftd), and client (sft) for Sangfor EasyConnect and aTrust VPNs"
 license = "AGPL-3.0-only"
 repository = "https://github.com/Mythologyli/zju-connect"
 publish = false
 
 [lib]
-name = "zju_connect"
+name = "sangfordetunz"
 path = "src/lib.rs"
 
 [[bin]]
-name = "zju-connect"
-path = "src/main.rs"
+name = "sftd"
+path = "src/bin/sftd.rs"
+
+[[bin]]
+name = "sft"
+path = "src/bin/sft.rs"
 
 [dependencies]
 async-trait = "0.1"

@@ -8,9 +8,12 @@ compile_error!("zju-connect's Rust port supports Linux only");
 
 pub mod atrust;
 pub mod config;
+pub mod control;
 pub mod easyconnect;
+pub mod manager;
 pub mod policy;
 pub mod resource;
+pub mod runner;
 pub mod service;
 #[cfg(target_os = "linux")]
 pub mod tun;

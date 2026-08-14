@@ -1,24 +1,38 @@
-# Linux Rust client configuration. Empty proxy bind values disable that listener.
-protocol = "easyconnect" # "easyconnect" or "atrust"
+# sangfordetunz daemon configuration.
+#
+# The daemon (sftd) reads this file, and the client (sft) selects a connection
+# by profile name, e.g. `sft up zju`. Each [profiles.<name>] block is a full
+# connection definition; add as many as you need.
+
+[daemon]
+# Unix socket sftd listens on and sft connects to.
+socket = "/run/sangfordetunz.sock"
+
+# ---------------------------------------------------------------------------
+# EasyConnect example (ZJU RVPN). `sft up zju`
+# ---------------------------------------------------------------------------
+[profiles.zju]
+protocol = "easyconnect"        # "easyconnect" or "atrust"
 server_address = "rvpn.zju.edu.cn"
 server_port = 443
 username = "username"
 password = "password"
+autostart = false               # bring this profile up when sftd starts
 
-# Proxies default to loopback. To expose them on a non-loopback address,
-# set socks_user/socks_password (enforced for SOCKS and HTTP) or, only if you
-# accept an unauthenticated relay into the VPN, set allow_open_proxy = true.
+# Proxies default to loopback. To expose them on a non-loopback address, set
+# socks_user/socks_password (enforced for SOCKS and HTTP) or, only if you accept
+# an unauthenticated relay into the VPN, set allow_open_proxy = true.
 socks_bind = "127.0.0.1:1080"
 socks_user = ""
 socks_password = ""
 http_bind = "127.0.0.1:1081"
 allow_open_proxy = false
 
-# The auth channel verifies the gateway certificate by default. Enable this
-# only for gateways with a self-signed certificate; it disables MITM protection.
+# The auth channel verifies the gateway certificate by default. Enable this only
+# for gateways with a self-signed certificate; it disables MITM protection.
 insecure_skip_verify = false
 
-tun_mode = false          # requires root or CAP_NET_ADMIN
+tun_mode = false                # requires root or CAP_NET_ADMIN
 add_route = false
 proxy_all = false
 disable_remote_dns = false
@@ -33,7 +47,8 @@ disable_multi_line = false
 disable_keep_alive = false
 debug_dump = false
 
-graph_code_file = "captcha.png"
+# Interactive challenges (CAPTCHA, SMS) cannot be answered in daemon mode; set
+# totp_secret for TOTP gateways, or reuse a preconfigured session (twf_id).
 totp_secret = ""
 
 custom_proxy_domain = [
@@ -44,15 +59,27 @@ custom_dns = [
 #   { host_name = "appservice.zju.edu.cn", ip = "10.203.8.198" },
 ]
 
-# aTrust settings. Its SOCKS/HTTP TCP transport does not require root.
+# ---------------------------------------------------------------------------
+# aTrust example. `sft up work`. Its SOCKS/HTTP TCP transport needs no root.
+# ---------------------------------------------------------------------------
+[profiles.work]
+protocol = "atrust"
+server_address = "vpn.example.edu"
+server_port = 443
+username = "username"
+password = "password"
+autostart = false
+
+socks_bind = "127.0.0.1:2080"
+http_bind = "127.0.0.1:2081"
+
 auth_type = "auth/psw"
 login_domain = "Radius"
 tcp_tunnel_mode = false
 skip_tcp_tunnel_wait = false
-# update_best_nodes_interval is not implemented yet; setting it fails validation.
 
-# Optional aTrust session reuse/debug fields may be set when needed. sid reuse
-# also requires device_id and an existing resource_file:
+# Optional aTrust session reuse fields. sid reuse also requires device_id and an
+# existing resource_file:
 # sid = "..."
 # device_id = "..."
 # sign_key = "..."
@@ -61,4 +88,5 @@ skip_tcp_tunnel_wait = false
 # These upstream features are intentionally rejected until their Rust ports land:
 # shadowsocks_url, dial_direct_proxy, dns_server_bind, keep_alive_url,
 # dns_hijack, fake_ip, bind_interface, auto_detect_interface, cert_file,
-# port_forwarding, CAS/OAuth login, and UDP forwarding.
+# port_forwarding, update_best_nodes_interval, CAS/OAuth login, and UDP
+# forwarding.

@@ -1,8 +1,88 @@
-use std::{net::IpAddr, path::Path};
+use std::{collections::BTreeMap, net::IpAddr, path::Path};
 
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
+
+/// Default path for the `sftd` control socket.
+pub const DEFAULT_SOCKET_PATH: &str = "/run/sangfordetunz.sock";
+
+/// Top-level daemon configuration: global settings plus named connection
+/// profiles the client selects by name.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    #[serde(default)]
+    pub daemon: DaemonSettings,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, Config>,
+}
+
+/// Daemon-wide settings that are not part of any single connection.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DaemonSettings {
+    /// Unix socket the daemon listens on for client commands.
+    pub socket: String,
+}
+
+impl Default for DaemonSettings {
+    fn default() -> Self {
+        Self {
+            socket: DEFAULT_SOCKET_PATH.into(),
+        }
+    }
+}
+
+impl DaemonConfig {
+    /// Load and validate a daemon configuration file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error, a TOML syntax/schema error, or a validation error
+    /// for any profile.
+    pub async fn from_file(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let text = tokio::fs::read_to_string(path).await?;
+        Self::from_toml(&text)
+    }
+
+    /// Parse and validate a daemon configuration from TOML text.
+    ///
+    /// # Errors
+    ///
+    /// Returns a TOML error or a per-profile validation error.
+    pub fn from_toml(text: &str) -> Result<Self, Error> {
+        let config: Self = toml::from_str(text)
+            .map_err(|error| Error::Config(format!("could not parse TOML: {error}")))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate every profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming the first invalid profile.
+    pub fn validate(&self) -> Result<(), Error> {
+        for (name, profile) in &self.profiles {
+            profile
+                .validate()
+                .map_err(|error| Error::Config(format!("profile {name:?}: {error}")))?;
+        }
+        Ok(())
+    }
+
+    /// Look up a profile by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if no such profile exists.
+    pub fn profile(&self, name: &str) -> Result<&Config, Error> {
+        self.profiles
+            .get(name)
+            .ok_or_else(|| Error::Config(format!("no profile named {name:?}")))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -54,6 +134,8 @@ pub struct Config {
     pub skip_tcp_tunnel_wait: bool,
     pub tun_mode: bool,
     pub add_route: bool,
+    /// Bring this profile up automatically when the daemon starts.
+    pub autostart: bool,
     pub dns_hijack: bool,
     pub fake_ip: bool,
     pub bind_interface: Option<String>,
@@ -153,6 +235,7 @@ impl Default for Config {
             skip_tcp_tunnel_wait: false,
             tun_mode: false,
             add_route: false,
+            autostart: false,
             dns_hijack: false,
             fake_ip: false,
             bind_interface: None,
@@ -602,9 +685,13 @@ mod tests {
 
     #[test]
     fn repository_example_remains_compatible() {
-        let config: Config = toml::from_str(include_str!("../config.toml.example")).unwrap();
-        config.validate().unwrap();
-        assert_eq!(config.server_address, "rvpn.zju.edu.cn");
-        assert_eq!(config.socks_password, "");
+        let config = DaemonConfig::from_toml(include_str!("../config.toml.example")).unwrap();
+        assert!(
+            config.profiles.contains_key("zju"),
+            "example must define a [profiles.zju] block"
+        );
+        for profile in config.profiles.values() {
+            profile.validate().unwrap();
+        }
     }
 }
