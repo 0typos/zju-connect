@@ -128,4 +128,4 @@ The custom TLS implementation is deliberately isolated to the legacy Sangfor `L3
 
 ## License and attribution
 
-GPL-3.0-only. This project derives from ZJU Connect and EasierConnect; see [`LICENSE`](LICENSE) and the repository history for contributors.
+AGPL-3.0-only. This project derives from ZJU Connect and EasierConnect; see [`LICENSE`](LICENSE) and the repository history for contributors.
