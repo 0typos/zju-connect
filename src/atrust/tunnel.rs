@@ -354,10 +354,14 @@ where
                 app.write_all(&data).await?;
             }
             [0x01, 0x01] => {
+                // Only a 0x3030 payload is a close; the official client keeps
+                // reading through any other control value.
                 let mut close = [0_u8; 2];
                 tls.read_exact(&mut close).await?;
-                app.shutdown().await?;
-                return Ok(());
+                if close == [0x30, 0x30] {
+                    app.shutdown().await?;
+                    return Ok(());
+                }
             }
             [0x53, 0x00] => {
                 let length = tls.read_u16().await?;
@@ -370,12 +374,15 @@ where
                     )));
                 }
             }
-            [0x05, 0x81] => {}
+            // The gateway interleaves bare two-byte control frames (the
+            // 05 81 acknowledgement, and with skip_tcp_tunnel_wait also the
+            // deferred 05 xx connect status); the official client reads past
+            // every header it does not recognize.
             _ => {
-                return Err(Error::Protocol(format!(
-                    "unexpected aTrust TCP data frame: {}",
-                    hex::encode(header)
-                )));
+                tracing::trace!(
+                    frame = %hex::encode(header),
+                    "ignoring aTrust TCP tunnel frame"
+                );
             }
         }
     }
@@ -418,6 +425,30 @@ mod tests {
             "Linux"
         );
         assert_eq!(value["xRequestSig"].as_str().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn tunnel_reader_closes_only_on_3030_control() {
+        let (mut wire, tunnel_side) = tokio::io::duplex(4096);
+        let (mut application, app_side) = tokio::io::duplex(4096);
+        let (tunnel_reader, _tunnel_writer) = tokio::io::split(tunnel_side);
+        let (_, app_writer) = tokio::io::split(app_side);
+        let task = tokio::spawn(tunnel_to_application(tunnel_reader, app_writer));
+
+        // Non-close 01 01 control, an unknown bare frame, a deferred connect
+        // status, then data, then a real close.
+        wire.write_all(&[0x01, 0x01, 0x31, 0x31]).await.unwrap();
+        wire.write_all(&[0x05, 0x81]).await.unwrap();
+        wire.write_all(&[0x05, 0x00]).await.unwrap();
+        wire.write_all(&[0x01, 0x00, 0x00, 0x02]).await.unwrap();
+        wire.write_all(b"ok").await.unwrap();
+        wire.write_all(&[0x01, 0x01, 0x30, 0x30]).await.unwrap();
+
+        let mut received = [0_u8; 2];
+        application.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"ok");
+        task.await.unwrap().unwrap();
+        assert_eq!(application.read(&mut received).await.unwrap(), 0);
     }
 
     #[tokio::test]

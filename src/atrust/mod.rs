@@ -237,7 +237,13 @@ async fn request_virtual_ip_inner(node: &str, sid: &str) -> Result<IpAddr, Error
         .connect(host, tcp)
         .await
         .map_err(|error| Error::Tls(error.to_string()))?;
+    negotiate_virtual_ip(&mut tls, sid).await
+}
 
+async fn negotiate_virtual_ip<S>(tls: &mut S, sid: &str) -> Result<IpAddr, Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let authentication = serde_json::to_vec(&serde_json::json!({"sid": sid}))
         .map_err(|error| Error::Protocol(format!("cannot encode aTrust sid: {error}")))?;
     let length = u16::try_from(authentication.len())
@@ -281,11 +287,14 @@ async fn request_virtual_ip_inner(node: &str, sid: &str) -> Result<IpAddr, Error
                 )
                 .into());
             }
+            // The gateway interleaves other frames (e.g. the 05 d0 method
+            // echo) before the virtual-IP response; the official flow reads
+            // past anything it does not recognize.
             _ => {
-                return Err(Error::Protocol(format!(
-                    "unexpected aTrust virtual-IP frame: {}",
-                    hex::encode(header)
-                )));
+                tracing::debug!(
+                    frame = %hex::encode(header),
+                    "ignoring aTrust virtual-IP negotiation frame"
+                );
             }
         }
     }
@@ -353,5 +362,39 @@ mod tests {
             ("major".into(), "node-b:441".into()),
         ]);
         assert_eq!(preferred_node(&nodes, "major"), Some("node-b:441"));
+    }
+
+    #[tokio::test]
+    async fn virtual_ip_negotiation_skips_method_echo() {
+        let (mut gateway, mut client) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            // Method echo, then an authorization result, then the IP reply.
+            gateway.write_all(&[0x05, 0xd0]).await.unwrap();
+            gateway.write_all(&[0x53, 0x00, 0x00, 0x02]).await.unwrap();
+            gateway.write_all(b"OK").await.unwrap();
+            gateway
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 10, 20, 30, 40])
+                .await
+                .unwrap();
+        });
+        let ip = negotiate_virtual_ip(&mut client, "session-sid")
+            .await
+            .unwrap();
+        assert_eq!(ip, IpAddr::from([10, 20, 30, 40]));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn virtual_ip_negotiation_rejects_failed_authorization() {
+        let (mut gateway, mut client) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            gateway.write_all(&[0x53, 0x00, 0x00, 0x04]).await.unwrap();
+            gateway.write_all(b"BUSY").await.unwrap();
+        });
+        let error = negotiate_virtual_ip(&mut client, "session-sid")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("authorization failed"));
+        server.await.unwrap();
     }
 }

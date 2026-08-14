@@ -39,6 +39,7 @@ struct L3Settings {
     device_id: String,
     connection_id: String,
     sign_key: Vec<u8>,
+    expected_vip: Option<IpAddr>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -74,6 +75,7 @@ struct NodeHandle {
 enum Frame {
     Data(Vec<u8>),
     Authentication { status: u8, payload: Vec<u8> },
+    VipUpdate { status: u8, payload: Vec<u8> },
     Heartbeat,
     Other,
 }
@@ -93,6 +95,7 @@ impl AtrustClient {
             connection_id: self.connection_id.clone(),
             sign_key: hex::decode(&self.sign_key)
                 .map_err(|error| Error::Config(format!("invalid aTrust sign key: {error}")))?,
+            expected_vip: self.client_ip,
         };
         let best_nodes = self.best_nodes.clone();
         let (application, bridge) = tokio::io::duplex(256 * 1024);
@@ -201,7 +204,8 @@ async fn open_node(
     incoming: mpsc::Sender<Vec<u8>>,
 ) -> Result<NodeHandle, Error> {
     let mut tls = connect_tls(endpoint).await?;
-    authenticate_tunnel(&mut tls, &settings.sid).await?;
+    let negotiated = authenticate_tunnel(&mut tls, &settings.sid).await?;
+    report_negotiated_vips(&negotiated, settings.expected_vip);
     let (sender, receiver) = mpsc::channel(1024);
     tokio::spawn(async move {
         if let Err(error) = node_loop(tls, settings, receiver, incoming).await {
@@ -226,7 +230,10 @@ async fn connect_tls(endpoint: &str) -> Result<TlsStream<TcpStream>, Error> {
         .map_err(|error| Error::Tls(error.to_string()))
 }
 
-async fn authenticate_tunnel(tls: &mut TlsStream<TcpStream>, sid: &str) -> Result<(), Error> {
+async fn authenticate_tunnel<S>(tls: &mut S, sid: &str) -> Result<Vec<IpAddr>, Error>
+where
+    S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let json = serde_json::to_vec(&serde_json::json!({"sid": sid}))
         .map_err(|error| Error::Protocol(format!("cannot encode aTrust sid: {error}")))?;
     let length =
@@ -285,7 +292,72 @@ async fn authenticate_tunnel(tls: &mut TlsStream<TcpStream>, sid: &str) -> Resul
     };
     let mut vip = vec![0_u8; vip_length];
     tls.read_exact(&mut vip).await?;
-    Ok(())
+    Ok(parse_virtual_ip_data(&vip))
+}
+
+fn parse_virtual_ip_data(data: &[u8]) -> Vec<IpAddr> {
+    match data.len() {
+        6 => vec![Ipv4Addr::new(data[0], data[1], data[2], data[3]).into()],
+        18 => vec![ipv6_from(&data[..16])],
+        22 => vec![
+            Ipv4Addr::new(data[0], data[1], data[2], data[3]).into(),
+            ipv6_from(&data[4..20]),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn ipv6_from(bytes: &[u8]) -> IpAddr {
+    let mut octets = [0_u8; 16];
+    octets.copy_from_slice(bytes);
+    std::net::Ipv6Addr::from(octets).into()
+}
+
+fn report_negotiated_vips(negotiated: &[IpAddr], expected: Option<IpAddr>) {
+    let Some(expected) = expected else { return };
+    if negotiated.is_empty() || negotiated.contains(&expected) {
+        return;
+    }
+    // The TUN keeps the address from the initial negotiation; a different
+    // per-node lease means the gateway may drop packets sourced from it.
+    tracing::warn!(
+        %expected,
+        ?negotiated,
+        "aTrust node negotiated a different virtual IP than the TUN uses"
+    );
+}
+
+fn handle_vip_update(status: u8, payload: &[u8], expected: Option<IpAddr>) {
+    if status != 0 {
+        tracing::debug!(status, "aTrust virtual-IP update carried an error status");
+        return;
+    }
+    report_negotiated_vips(&extract_vips(payload), expected);
+}
+
+fn extract_vips(payload: &[u8]) -> Vec<IpAddr> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return Vec::new();
+    };
+    let vip_at = |object: &serde_json::Value, key: &str| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.parse::<IpAddr>().ok())
+    };
+    let object = if vip_at(&value, "vip").is_some() || vip_at(&value, "vip6").is_some() {
+        value.clone()
+    } else {
+        value.get("data").cloned().unwrap_or(value)
+    };
+    let mut addresses = Vec::new();
+    if let Some(IpAddr::V4(address)) = vip_at(&object, "vip") {
+        addresses.push(IpAddr::V4(address));
+    }
+    if let Some(IpAddr::V6(address)) = vip_at(&object, "vip6") {
+        addresses.push(IpAddr::V6(address));
+    }
+    addresses
 }
 
 async fn node_loop(
@@ -334,6 +406,9 @@ async fn node_loop(
                             &mut flows,
                             &mut auth_flows,
                         ).await?;
+                    }
+                    Frame::VipUpdate { status, payload } => {
+                        handle_vip_update(status, &payload, settings.expected_vip);
                     }
                     Frame::Heartbeat | Frame::Other => {}
                 }
@@ -484,7 +559,7 @@ async fn read_frame(tls: &mut TlsStream<TcpStream>) -> Result<Frame, Error> {
                 if header[1] == AUTH_RESPONSE {
                     Ok(Frame::Authentication { status, payload })
                 } else {
-                    Ok(Frame::Other)
+                    Ok(Frame::VipUpdate { status, payload })
                 }
             }
             DATA_RESPONSE => {
@@ -789,6 +864,59 @@ struct ProcessEnvironment<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parses_virtual_ip_payload_shapes() {
+        assert_eq!(
+            parse_virtual_ip_data(&[10, 0, 0, 7, 0, 0]),
+            vec![IpAddr::from([10, 0, 0, 7])]
+        );
+        let mut dual = vec![10, 0, 0, 7];
+        dual.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        dual.extend_from_slice(&[0, 0]);
+        assert_eq!(
+            parse_virtual_ip_data(&dual),
+            vec![
+                IpAddr::from([10, 0, 0, 7]),
+                "2001:db8::1".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert!(parse_virtual_ip_data(&[1, 2, 3]).is_empty());
+    }
+
+    #[test]
+    fn extracts_vip_updates_from_flat_and_nested_json() {
+        assert_eq!(
+            extract_vips(br#"{"vip":"10.0.0.9"}"#),
+            vec![IpAddr::from([10, 0, 0, 9])]
+        );
+        assert_eq!(
+            extract_vips(br#"{"data":{"vip":"10.0.0.9","vip6":"2001:db8::9"}}"#),
+            vec![
+                IpAddr::from([10, 0, 0, 9]),
+                "2001:db8::9".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert!(extract_vips(b"not json").is_empty());
+        assert!(extract_vips(br#"{"data":{"vip":""}}"#).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tunnel_authentication_returns_negotiated_vip() {
+        let (mut gateway, mut client) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            // Method echo, empty auth result, then a type-1 virtual IP.
+            gateway.write_all(&[VERSION, 0xd0]).await.unwrap();
+            gateway.write_all(&[0x53, 0x00, 0x00, 0x00]).await.unwrap();
+            gateway
+                .write_all(&[VERSION, 0, 0, 1, 10, 0, 0, 7, 0, 0])
+                .await
+                .unwrap();
+        });
+        let vips = authenticate_tunnel(&mut client, "sid").await.unwrap();
+        assert_eq!(vips, vec![IpAddr::from([10, 0, 0, 7])]);
+        server.await.unwrap();
+    }
+
     fn ipv4_packet(protocol: u8, source_port: u16, destination_port: u16) -> Vec<u8> {
         let mut packet = vec![0_u8; 24];
         packet[0] = 0x45;
@@ -830,6 +958,7 @@ mod tests {
             device_id: "device".into(),
             connection_id: "connection".into(),
             sign_key: vec![0xab; 32],
+            expected_vip: None,
         };
         let meta = parse_packet_meta(&ipv4_packet(6, 12345, 443)).unwrap();
         let encoded = build_flow_authentication(&settings, &meta, "app", 7).unwrap();
