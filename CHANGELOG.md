@@ -8,6 +8,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Daemon/client architecture.** The project is now `sangfordetunz`, built as
+  two binaries: `sftd` (a daemon that holds one or more named connection
+  profiles) and `sft` (a control client). The daemon reads a TOML file of
+  `[profiles.<name>]` blocks, autostarts profiles flagged with `autostart`, and
+  serves `sft up`/`down`/`status`/`list`/`reload`/`ping` over a Unix socket.
+  `sft check-config` validates a file without the daemon. Each profile gets its
+  own TUN interface (`sft-<profile>`). Interactive CAPTCHA/SMS challenges are not
+  answerable in daemon mode; TOTP is answered from the profile secret.
+- Library modules `control`, `runner`, and `manager` (`ConnectionManager`
+  supervises named connections with graceful-then-abort shutdown).
 - Ground-up Rust rewrite of the Linux client for Sangfor EasyConnect and aTrust
   gateways: password/CAPTCHA/SMS/TOTP authentication, multi-line selection,
   server resource and split-tunnel policy parsing, the EasyConnect L3IP

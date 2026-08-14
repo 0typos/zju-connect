@@ -1,6 +1,6 @@
-# ZJU Connect (Rust/Linux port)
+# sangfordetunz
 
-An asynchronous Rust library and Linux CLI for connecting to Sangfor EasyConnect and aTrust VPN gateways.
+An asynchronous Rust library, daemon (`sftd`), and client (`sft`) for connecting to Sangfor EasyConnect and aTrust VPN gateways on Linux.
 
 > This software is provided as-is. VPN software changes system routes and handles sensitive credentials. Review the configuration and use it at your own risk.
 
@@ -21,7 +21,8 @@ The Rust implementation currently provides:
 - aTrust password, CAPTCHA, SMS, and TOTP authentication
 - aTrust policy parsing, node selection, virtual-IP negotiation, per-flow authorization, and L3 packet tunnels
 - aTrust connectivity through Linux TUN or its native per-application TCP proxy tunnels
-- a reusable async Rust API (`VpnClient`, `EasyConnectClient`, `AtrustClient`, policy, resource, proxy, and TUN modules)
+- a background daemon (`sftd`) that holds one or more named connection profiles, controlled by a Unix-socket client (`sft up`/`down`/`status`/`list`/`reload`)
+- a reusable async Rust API (`VpnClient`, `EasyConnectClient`, `AtrustClient`, policy, resource, proxy, TUN, and connection-manager modules)
 
 Still to port: aTrust CAS/OAuth/RADIUS/enhanced login, certificate authentication, Shadowsocks, TCP/UDP forwarding, DNS listener/hijacking, Fake IP, and explicit underlay-interface binding. Enabling an unimplemented configuration option fails validation instead of silently ignoring it.
 
@@ -41,62 +42,65 @@ cargo build --release
 cargo test --all-targets
 ```
 
-The binary is `target/release/zju-connect` and the library crate is `zju_connect`.
+The build produces two binaries — `target/release/sftd` (daemon) and `target/release/sft` (client) — and the library crate `sangfordetunz`.
 
-## CLI
+## Configuration
 
-EasyConnect with the default SOCKS5 (`0.0.0.0:1080`) and HTTP (`0.0.0.0:1081`) proxies:
+Connections are defined as named profiles in a single TOML file. Copy [`config.toml.example`](config.toml.example) and edit the `[profiles.<name>]` blocks:
 
-```bash
-sudo --preserve-env=ZJU_CONNECT_USERNAME,ZJU_CONNECT_PASSWORD \
-  target/release/zju-connect
+```toml
+[daemon]
+socket = "/run/sangfordetunz.sock"
+
+[profiles.zju]
+protocol = "easyconnect"
+server_address = "rvpn.zju.edu.cn"
+username = "student-id"
+password = "password"
+autostart = false        # bring this profile up when sftd starts
+
+[profiles.work]
+protocol = "atrust"
+server_address = "vpn.example.edu"
+username = "user"
+password = "password"
 ```
 
-Credentials can be supplied through flags, but environment variables avoid putting the password in shell history:
+Validate it without contacting a gateway:
 
 ```bash
-export ZJU_CONNECT_USERNAME='student-id'
-export ZJU_CONNECT_PASSWORD='password'
-sudo --preserve-env=ZJU_CONNECT_USERNAME,ZJU_CONNECT_PASSWORD \
-  target/release/zju-connect --tun-mode --add-route
+sft check-config config.toml
 ```
 
-Useful modes:
+## Daemon and client
+
+Start the daemon (foreground; normally under systemd — see [`docs/service_en.md`](docs/service_en.md)). TUN mode and EasyConnect proxy mode need root or `CAP_NET_ADMIN`; the default aTrust SOCKS/HTTP mode does not.
 
 ```bash
-# Validate TOML without contacting the gateway
-zju-connect --config config.toml --check-config
-
-# Authenticate and inspect gateway policy without creating a TUN device
-zju-connect --username USER --password PASS --control-plane-only
-
-# Disable one or both proxy listeners (an empty argument disables it)
-zju-connect --socks-bind '' --http-bind '' --tun-mode --add-route
+sudo sftd --config config.toml
 ```
 
-For an aTrust gateway, the current data plane is its native per-application TCP tunnel and does not require root:
+Control it with `sft`:
 
 ```bash
-zju-connect --protocol atrust --server vpn.example.edu \
-  --username USER --password PASS
+sft up zju          # bring the 'zju' profile up
+sft status          # show active connections, their state, IP, and uptime
+sft list            # every configured profile, and which are active
+sft down zju        # bring it down
+sft reload          # re-read the configuration file
+sft ping            # check the daemon is responding
 ```
 
-EasyConnect proxy mode and either protocol's TUN mode use the kernel TUN data path and therefore need root or `CAP_NET_ADMIN`. Press Ctrl-C to close the interface and VPN session. The default aTrust SOCKS/HTTP mode uses native TCP tunnels and does not create a TUN device.
-
-For a configuration file, copy [`config.toml.example`](config.toml.example), then run:
-
-```bash
-sudo target/release/zju-connect --config config.toml
-```
+`sft` talks to the daemon over the Unix socket in `[daemon].socket` (override with `--socket`). Interactive challenges (CAPTCHA, SMS) cannot be answered by a background daemon; set `totp_secret` for a TOTP gateway, or reuse a preconfigured session.
 
 ## Library
 
 The public API deliberately separates interactive prompts from protocol logic. Embedders implement `ChallengeHandler`, create an `EasyConnectClient`, then use the common `VpnClient` trait:
 
 ```rust,no_run
-use zju_connect::{Config, VpnClient, easyconnect::EasyConnectClient};
+use sangfordetunz::{Config, VpnClient, easyconnect::EasyConnectClient};
 
-# async fn example(handler: &dyn zju_connect::ChallengeHandler) -> Result<(), zju_connect::Error> {
+# async fn example(handler: &dyn sangfordetunz::ChallengeHandler) -> Result<(), sangfordetunz::Error> {
 let mut client = EasyConnectClient::new(Config::default())?;
 let connection = client.connect(handler).await?;
 let packets = client.open_l3().await?;
@@ -107,16 +111,20 @@ client.close().await?;
 # }
 ```
 
-`open_l3()` returns an async stream of complete IP packets. Applications may attach it to the included Linux TUN integration or provide their own network stack. `AtrustClient::connect_control_plane()` prepares aTrust policy, and its `TcpConnector` implementation can alternatively back the included proxy service without TUN.
+`open_l3()` returns an async stream of complete IP packets. Applications may attach it to the included Linux TUN integration or provide their own network stack. `AtrustClient::connect_control_plane()` prepares aTrust policy, and its `TcpConnector` implementation can alternatively back the included proxy service without TUN. The `manager::ConnectionManager` supervises named connections the same way `sftd` does.
 
 ## Docker
 
-The container requires access to the TUN device and `NET_ADMIN`; the included Compose file supplies both:
+The image runs `sftd`. The container needs access to the TUN device and `NET_ADMIN` for TUN-mode profiles; the included Compose file supplies both:
 
 ```bash
 cp config.toml.example config.toml
 docker compose up --build
+# then, in another shell:
+docker compose exec sangfordetunz sft up zju
 ```
+
+Because the proxies default to `127.0.0.1`, set the profile's binds to `0.0.0.0` (with credentials or `allow_open_proxy = true`) if you publish container ports.
 
 Because the proxies default to `127.0.0.1`, a published container port cannot reach them. For Docker, set the binds to `0.0.0.0` in `config.toml` and either configure `socks_user`/`socks_password` or set `allow_open_proxy = true` (the container's network namespace is isolated, and Docker only exposes the ports you publish).
 

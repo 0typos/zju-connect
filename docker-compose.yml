@@ -1,16 +1,17 @@
 services:
-  zju-connect:
+  sangfordetunz:
     build:
       context: .
-    image: zju-connect-rust
-    container_name: zju-connect
+    image: sangfordetunz
+    container_name: sangfordetunz
     restart: unless-stopped
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+    # Publish the proxy ports your profiles bind (set their binds to 0.0.0.0).
     ports:
       - "1080:1080"
       - "1081:1081"
     volumes:
-      - ./config.toml:/etc/zju-connect/config.toml:ro
+      - ./config.toml:/etc/sangfordetunz/config.toml:ro

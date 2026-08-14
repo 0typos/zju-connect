@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: 向 zju-connect 提出建议/功能请求
+about: 向 sangfordetunz 提出建议/功能请求
 title: ''
 labels: enhancement
 assignees: Mythologyli

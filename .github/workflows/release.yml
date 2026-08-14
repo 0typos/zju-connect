@@ -23,7 +23,7 @@ jobs:
       # tar.gz of the release binary to the GitHub release.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: zju-connect
+          bin: sftd,sft
           target: ${{ matrix.target }}
-          archive: zju-connect-$target
+          archive: sangfordetunz-$target
           token: ${{ secrets.GITHUB_TOKEN }}

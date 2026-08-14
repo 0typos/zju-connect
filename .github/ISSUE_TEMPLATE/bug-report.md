@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: 报告 zju-connect 中存在的错误
+about: 报告 sangfordetunz 中存在的错误
 title: ''
 labels: bug
 assignees: Mythologyli
@@ -14,7 +14,7 @@ assignees: Mythologyli
 + 如果你可以访问 CC98，请确保你已经阅读过以下说明：
     + [使用 ZJU Connect 代替 EasyConnect 提升你的 RVPN 体验](https://www.cc98.org/topic/5521873)
     + [端口转发、定时保活、自动选线、密码保存](https://www.cc98.org/topic/5570875)
-+ 如果你是非 ZJU 用户，请确保你使用如下启动参数时仍然有误：`zju-connect --server <服务器地址> --port <服务器端口> --username xxx --password xxx --disable-server-config --skip-domain-resource`（`disable-keep-alive`、`disable-zju-config`、`remote-dns-server` 等仅支持在 TOML 配置文件中设置）
++ 如果你是非 ZJU 用户，请先用最小配置确认问题仍然存在：在 `config.toml` 的 `[profiles.<名称>]` 中仅设置 `server_address`、`server_port`、`username`、`password`，并加上 `disable_server_config = true`、`skip_domain_resource = true`，然后 `sft check-config config.toml` 通过后由 `sftd` 启动、`sft up <名称>` 连接
 + 你已搜索过现有的 [Issues](https://github.com/Mythologyli/zju-connect/issues?q=is%3Aissue) 并且未发现重复
 
 **确认无误后，请删除下方横线及以上内容。之后，请修改下方的模版并提交报告**

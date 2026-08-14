@@ -1,28 +1,36 @@
-# Run as a Linux systemd service
+# Run sftd as a Linux systemd service
 
-First run the client interactively and confirm the gateway settings. Repeated failed logins can trigger temporary gateway lockouts.
-
-Install the release binary and configuration:
+Validate the configuration first; repeated failed logins can trigger temporary
+gateway lockouts.
 
 ```bash
-sudo install -Dm755 target/release/zju-connect /usr/local/bin/zju-connect
-sudo install -Dm600 config.toml /etc/zju-connect/config.toml
+sft check-config config.toml
 ```
 
-Create `/etc/systemd/system/zju-connect.service`:
+Install both binaries and the configuration:
+
+```bash
+sudo install -Dm755 target/release/sftd /usr/local/bin/sftd
+sudo install -Dm755 target/release/sft /usr/local/bin/sft
+sudo install -Dm600 config.toml /etc/sangfordetunz/config.toml
+```
+
+Create `/etc/systemd/system/sftd.service`:
 
 ```ini
 [Unit]
-Description=ZJU Connect VPN
+Description=sangfordetunz VPN daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/zju-connect --config /etc/zju-connect/config.toml
+ExecStart=/usr/local/bin/sftd --config /etc/sangfordetunz/config.toml
 Restart=on-failure
 RestartSec=5s
-# TUN mode needs these privileges. Remove both lines for aTrust proxy-only mode.
+RuntimeDirectory=sangfordetunz
+# TUN mode needs these privileges. Remove both lines if every profile is an
+# aTrust proxy-only connection.
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=true
@@ -31,12 +39,23 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-Enable it:
+Enable it, then control connections with `sft`:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now zju-connect.service
-sudo journalctl -u zju-connect.service -f
+sudo systemctl enable --now sftd.service
+sudo journalctl -u sftd.service -f
+
+sudo sft up zju        # bring a profile up (or set autostart = true)
+sudo sft status        # show active connections
+sudo sft down zju
 ```
 
-The configuration contains credentials and should remain readable only by root. Interactive CAPTCHA/SMS prompts are unsuitable for a background unit; complete those once interactively or use a supported TOTP configuration before enabling the service.
+Notes:
+
+- The configuration contains credentials and should remain readable only by
+  root.
+- The default control socket is `/run/sangfordetunz.sock`; `sft` needs read/write
+  access to it, so run it as root (or grant the socket to a group).
+- Interactive CAPTCHA/SMS prompts cannot be answered by a background daemon. Set
+  `totp_secret` for a TOTP gateway, or reuse a preconfigured session.
