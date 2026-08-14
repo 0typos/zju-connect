@@ -32,6 +32,12 @@ const HEARTBEAT_RESPONSE: u8 = 0x95;
 const SECOND_VIP_RESPONSE: u8 = 0x96;
 const MAX_PENDING_PACKETS: usize = 64;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_HEARTBEAT_MISSES: u32 = 3;
+const NODE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const NODE_RETRY_COOLDOWN: Duration = Duration::from_secs(3);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const FLOW_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct L3Settings {
@@ -60,6 +66,7 @@ struct Flow {
     auth_id: u64,
     token: Option<String>,
     pending: Vec<Vec<u8>>,
+    last_activity: tokio::time::Instant,
 }
 
 struct PacketCommand {
@@ -135,65 +142,157 @@ async fn run_l3(
     best_nodes: std::collections::BTreeMap<String, String>,
     settings: L3Settings,
 ) -> Result<(), Error> {
-    let (mut application_reader, mut application_writer) = tokio::io::split(bridge);
+    let (application_reader, mut application_writer) = tokio::io::split(bridge);
     let (incoming_sender, mut incoming_receiver) = mpsc::channel::<Vec<u8>>(4096);
+    let (outbound_sender, mut outbound_receiver) = mpsc::channel::<Vec<u8>>(256);
     let mut nodes = HashMap::<String, NodeHandle>::new();
+    let mut node_failures = HashMap::<String, tokio::time::Instant>::new();
 
-    loop {
+    // A dedicated task owns the multi-read packet framing so this loop only
+    // races cancellation-safe channel reads.
+    let reader = tokio::spawn(read_outbound_packets(application_reader, outbound_sender));
+
+    let result = loop {
         tokio::select! {
-            packet = read_ip_packet(&mut application_reader) => {
-                let packet = packet?;
-                let meta = parse_packet_meta(&packet)?;
-                let protocol = protocol_match(meta.key.protocol)?;
-                let resource = parsed.resources.ip.iter().rev().find(|resource| {
-                    resource.matches(
-                        IpAddr::V4(meta.key.destination),
-                        meta.key.destination_port,
-                        protocol,
-                    )
-                }).ok_or_else(|| Error::Resource(format!(
-                    "{}:{} is not an aTrust {protocol:?} resource",
-                    meta.key.destination, meta.key.destination_port
-                )))?;
-                let app_id = resource.app_id.clone().ok_or_else(|| {
-                    Error::Resource("aTrust L3 resource has no app ID".into())
-                })?;
-                let group = resource.node_group_id.clone().unwrap_or_default();
-                if !nodes.contains_key(&group) {
-                    let endpoint = best_nodes
-                        .get(&group)
-                        .or_else(|| best_nodes.get(&parsed.major_node_group))
-                        .ok_or_else(|| Error::Protocol(format!(
-                            "no reachable aTrust node for group {group:?}"
-                        )))?;
-                    let handle = open_node(
-                        endpoint,
-                        settings.clone(),
-                        incoming_sender.clone(),
-                    ).await?;
-                    nodes.insert(group.clone(), handle);
-                }
-                let command = PacketCommand { packet, meta, app_id };
-                let send_result = nodes
-                    .get(&group)
-                    .expect("node was inserted")
-                    .commands
-                    .send(command)
-                    .await;
-                if send_result.is_err() {
-                    nodes.remove(&group);
-                    return Err(Error::Protocol(format!(
-                        "aTrust node connection for group {group:?} closed"
-                    )));
-                }
+            outbound = outbound_receiver.recv() => {
+                let Some(packet) = outbound else {
+                    break Ok(());
+                };
+                forward_outbound_packet(
+                    packet,
+                    &parsed,
+                    &best_nodes,
+                    &settings,
+                    &incoming_sender,
+                    &mut nodes,
+                    &mut node_failures,
+                ).await;
             }
             incoming = incoming_receiver.recv() => {
-                let packet = incoming.ok_or_else(|| {
-                    Error::Protocol("all aTrust L3 node connections closed".into())
-                })?;
-                application_writer.write_all(&packet).await?;
-                application_writer.flush().await?;
+                let Some(packet) = incoming else {
+                    break Ok(());
+                };
+                if application_writer.write_all(&packet).await.is_err()
+                    || application_writer.flush().await.is_err()
+                {
+                    break Ok(());
+                }
             }
+        }
+    };
+    reader.abort();
+    result
+}
+
+async fn read_outbound_packets(
+    mut reader: tokio::io::ReadHalf<DuplexStream>,
+    packets: mpsc::Sender<Vec<u8>>,
+) {
+    loop {
+        match read_ip_packet(&mut reader).await {
+            Ok(packet) => {
+                if packets.send(packet).await.is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "aTrust L3 outbound stream ended");
+                return;
+            }
+        }
+    }
+}
+
+/// Route one TUN packet to its node connection. Per-packet problems drop the
+/// packet — IP is lossy by contract — and must never take the tunnel down.
+async fn forward_outbound_packet(
+    packet: Vec<u8>,
+    parsed: &super::ParsedResources,
+    best_nodes: &std::collections::BTreeMap<String, String>,
+    settings: &L3Settings,
+    incoming_sender: &mpsc::Sender<Vec<u8>>,
+    nodes: &mut HashMap<String, NodeHandle>,
+    node_failures: &mut HashMap<String, tokio::time::Instant>,
+) {
+    let meta = match parse_packet_meta(&packet) {
+        Ok(meta) => meta,
+        Err(error) => {
+            tracing::trace!(%error, "dropping unsupported TUN packet");
+            return;
+        }
+    };
+    let Ok(protocol) = protocol_match(meta.key.protocol) else {
+        tracing::trace!(protocol = meta.key.protocol, "dropping unsupported IP protocol");
+        return;
+    };
+    let resource = parsed.resources.ip.iter().rev().find(|resource| {
+        resource.matches(
+            IpAddr::V4(meta.key.destination),
+            meta.key.destination_port,
+            protocol,
+        )
+    });
+    let Some(resource) = resource else {
+        tracing::debug!(
+            destination = %meta.key.destination,
+            port = meta.key.destination_port,
+            "dropping packet with no matching aTrust resource"
+        );
+        return;
+    };
+    let Some(app_id) = resource.app_id.clone() else {
+        tracing::debug!(destination = %meta.key.destination, "aTrust resource has no app ID");
+        return;
+    };
+    let group = resource.node_group_id.clone().unwrap_or_default();
+
+    if !nodes.contains_key(&group) {
+        if node_failures
+            .get(&group)
+            .is_some_and(|failed| failed.elapsed() < NODE_RETRY_COOLDOWN)
+        {
+            return;
+        }
+        let endpoint = best_nodes
+            .get(&group)
+            .or_else(|| best_nodes.get(&parsed.major_node_group));
+        let Some(endpoint) = endpoint else {
+            tracing::debug!(group, "no reachable aTrust node for packet");
+            return;
+        };
+        let opened = tokio::time::timeout(
+            NODE_OPEN_TIMEOUT,
+            open_node(endpoint, settings.clone(), incoming_sender.clone()),
+        )
+        .await;
+        match opened {
+            Ok(Ok(handle)) => {
+                nodes.insert(group.clone(), handle);
+                node_failures.remove(&group);
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, group, "failed to open aTrust node connection");
+                node_failures.insert(group, tokio::time::Instant::now());
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(group, "timed out opening aTrust node connection");
+                node_failures.insert(group, tokio::time::Instant::now());
+                return;
+            }
+        }
+    }
+
+    let handle = nodes.get(&group).expect("node was just ensured");
+    match handle.commands.try_send(PacketCommand { packet, meta, app_id }) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::trace!(group, "dropping packet: node queue is full");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!(group, "aTrust node connection closed; scheduling reconnect");
+            nodes.remove(&group);
+            node_failures.insert(group, tokio::time::Instant::now());
         }
     }
 }
@@ -209,7 +308,7 @@ async fn open_node(
     let (sender, receiver) = mpsc::channel(1024);
     tokio::spawn(async move {
         if let Err(error) = node_loop(tls, settings, receiver, incoming).await {
-            tracing::debug!(%error, "aTrust L3 node connection closed");
+            tracing::warn!(%error, "aTrust L3 node connection closed; traffic will reconnect");
         }
     });
     Ok(NodeHandle { commands: sender })
@@ -360,82 +459,169 @@ fn extract_vips(payload: &[u8]) -> Vec<IpAddr> {
     addresses
 }
 
-async fn node_loop(
-    mut tls: TlsStream<TcpStream>,
+async fn node_loop<S>(
+    tls: S,
     settings: L3Settings,
     mut commands: mpsc::Receiver<PacketCommand>,
     incoming: mpsc::Sender<Vec<u8>>,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    S: AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let (read_half, mut write) = tokio::io::split(tls);
+    // A dedicated task owns the multi-read frame parser; dropping a partially
+    // completed read_frame future here would desync the wire stream.
+    let (frame_sender, mut frames) = mpsc::channel::<Result<Frame, Error>>(64);
+    let reader = tokio::spawn(async move {
+        let mut read_half = read_half;
+        loop {
+            let frame = read_frame(&mut read_half).await;
+            let failed = frame.is_err();
+            if frame_sender.send(frame).await.is_err() || failed {
+                return;
+            }
+        }
+    });
+
     let mut flows = HashMap::<FlowKey, Flow>::new();
     let mut auth_flows = HashMap::<u64, FlowKey>::new();
     let mut next_auth_id = 0_u64;
     let mut incoming_bytes = Vec::new();
+    let mut outstanding_heartbeats = 0_u32;
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
 
-    loop {
+    let result = loop {
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else {
-                    return Ok(());
+                    break Ok(());
                 };
-                process_command(
-                    &mut tls,
+                if let Err(error) = process_command(
+                    &mut write,
                     &settings,
                     command,
                     &mut flows,
                     &mut auth_flows,
                     &mut next_auth_id,
-                ).await?;
+                ).await {
+                    break Err(error);
+                }
             }
-            frame = read_frame(&mut tls) => {
-                match frame? {
+            frame = frames.recv() => {
+                let Some(frame) = frame else {
+                    break Err(Error::Protocol("aTrust node reader stopped".into()));
+                };
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => break Err(error),
+                };
+                match frame {
                     Frame::Data(data) => {
                         incoming_bytes.extend_from_slice(&data);
-                        for packet in take_complete_packets(&mut incoming_bytes)? {
-                            incoming.send(packet).await.map_err(|_| {
-                                Error::Protocol("aTrust L3 receiver closed".into())
-                            })?;
+                        match deliver_complete_packets(&mut incoming_bytes, &incoming).await {
+                            Ok(true) => {}
+                            Ok(false) => break Ok(()),
+                            Err(error) => break Err(error),
                         }
                     }
                     Frame::Authentication { status, payload } => {
-                        process_authentication_response(
-                            &mut tls,
+                        if let Err(error) = process_authentication_response(
+                            &mut write,
                             status,
                             &payload,
                             &mut flows,
                             &mut auth_flows,
-                        ).await?;
+                        ).await {
+                            break Err(error);
+                        }
                     }
                     Frame::VipUpdate { status, payload } => {
                         handle_vip_update(status, &payload, settings.expected_vip);
                     }
-                    Frame::Heartbeat | Frame::Other => {}
+                    Frame::Heartbeat => {
+                        outstanding_heartbeats = 0;
+                    }
+                    Frame::Other => {}
                 }
             }
             _ = heartbeat.tick() => {
-                tls.write_all(&[VERSION, HEARTBEAT_REQUEST, 0, 0]).await?;
+                if outstanding_heartbeats >= MAX_HEARTBEAT_MISSES {
+                    break Err(Error::Protocol(
+                        "aTrust node stopped answering heartbeats".into(),
+                    ));
+                }
+                if let Err(error) =
+                    write_with_timeout(&mut write, &[VERSION, HEARTBEAT_REQUEST, 0, 0]).await
+                {
+                    break Err(error);
+                }
+                outstanding_heartbeats += 1;
+                evict_stale_flows(&mut flows, &mut auth_flows);
             }
         }
-    }
+    };
+    reader.abort();
+    result
 }
 
-async fn process_command(
-    tls: &mut TlsStream<TcpStream>,
+/// Forward every complete packet in `incoming_bytes`; returns `Ok(false)`
+/// when the receiving side has shut down.
+async fn deliver_complete_packets(
+    incoming_bytes: &mut Vec<u8>,
+    incoming: &mpsc::Sender<Vec<u8>>,
+) -> Result<bool, Error> {
+    for packet in take_complete_packets(incoming_bytes)? {
+        if incoming.send(packet).await.is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn evict_stale_flows(flows: &mut HashMap<FlowKey, Flow>, auth_flows: &mut HashMap<u64, FlowKey>) {
+    flows.retain(|key, flow| {
+        let timeout = if flow.token.is_some() {
+            FLOW_IDLE_TIMEOUT
+        } else {
+            FLOW_AUTH_TIMEOUT
+        };
+        let keep = flow.last_activity.elapsed() < timeout;
+        if !keep {
+            tracing::trace!(?key, "evicting idle aTrust flow");
+            auth_flows.remove(&flow.auth_id);
+        }
+        keep
+    });
+}
+
+async fn write_with_timeout<W>(write: &mut W, data: &[u8]) -> Result<(), Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(WRITE_TIMEOUT, write.write_all(data))
+        .await
+        .map_err(|_| Error::Protocol("aTrust node write timed out".into()))??;
+    Ok(())
+}
+
+async fn process_command<W>(
+    tls: &mut W,
     settings: &L3Settings,
     command: PacketCommand,
     flows: &mut HashMap<FlowKey, Flow>,
     auth_flows: &mut HashMap<u64, FlowKey>,
     next_auth_id: &mut u64,
-) -> Result<(), Error> {
-    if let Some(token) = flows
-        .get(&command.meta.key)
-        .and_then(|flow| flow.token.as_deref())
-    {
-        return write_data_packet(tls, token, &command.packet).await;
-    }
-
+) -> Result<(), Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     if let Some(flow) = flows.get_mut(&command.meta.key) {
+        flow.last_activity = tokio::time::Instant::now();
+        if let Some(token) = flow.token.clone() {
+            return write_data_packet(tls, &token, &command.packet).await;
+        }
         if flow.pending.len() < MAX_PENDING_PACKETS {
             flow.pending.push(command.packet);
         }
@@ -444,13 +630,22 @@ async fn process_command(
 
     *next_auth_id = next_auth_id.wrapping_add(1).max(1);
     let auth_id = *next_auth_id;
-    let request = build_flow_authentication(settings, &command.meta, &command.app_id, auth_id)?;
-    let length = u16::try_from(request.len())
-        .map_err(|_| Error::Protocol("aTrust flow authorization is too large".into()))?;
+    let request = match build_flow_authentication(settings, &command.meta, &command.app_id, auth_id)
+    {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(%error, "cannot build aTrust flow authorization");
+            return Ok(());
+        }
+    };
+    let Ok(length) = u16::try_from(request.len()) else {
+        tracing::warn!("aTrust flow authorization is too large");
+        return Ok(());
+    };
     let mut frame = vec![VERSION, AUTH_REQUEST];
     frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(&request);
-    tls.write_all(&frame).await?;
+    write_with_timeout(tls, &frame).await?;
     auth_flows.insert(auth_id, command.meta.key.clone());
     flows.insert(
         command.meta.key,
@@ -458,35 +653,48 @@ async fn process_command(
             auth_id,
             token: None,
             pending: vec![command.packet],
+            last_activity: tokio::time::Instant::now(),
         },
     );
     Ok(())
 }
 
-async fn process_authentication_response(
-    tls: &mut TlsStream<TcpStream>,
+/// Handle one flow-authorization reply. A rejected or malformed authorization
+/// affects only its flow — the entry is dropped so the next packet retries —
+/// and only connection-level write failures are propagated.
+async fn process_authentication_response<W>(
+    tls: &mut W,
     status: u8,
     payload: &[u8],
     flows: &mut HashMap<FlowKey, Flow>,
     auth_flows: &mut HashMap<u64, FlowKey>,
-) -> Result<(), Error> {
-    let response: FlowAuthResponse = serde_json::from_slice(payload).map_err(|error| {
-        Error::Protocol(format!(
-            "invalid aTrust flow authorization response: {error}"
-        ))
-    })?;
+) -> Result<(), Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let response: FlowAuthResponse = match serde_json::from_slice(payload) {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%error, "ignoring malformed aTrust flow authorization response");
+            return Ok(());
+        }
+    };
     let auth_id = response.data.conntrack_hash;
-    let key = auth_flows.remove(&auth_id).ok_or_else(|| {
-        Error::Protocol(format!(
-            "aTrust returned unknown flow authorization {auth_id}"
-        ))
-    })?;
+    let Some(key) = auth_flows.remove(&auth_id) else {
+        tracing::debug!(auth_id, "ignoring unknown aTrust flow authorization");
+        return Ok(());
+    };
     if status != 0 || response.code != 0 {
         flows.remove(&key);
-        return Err(Error::Authentication(format!(
-            "aTrust flow authorization failed (status {status}, code {}): {}",
-            response.code, response.message
-        )));
+        tracing::warn!(
+            destination = %key.destination,
+            port = key.destination_port,
+            status,
+            code = response.code,
+            message = %response.message,
+            "aTrust flow authorization rejected; the flow will retry on new traffic"
+        );
+        return Ok(());
     }
     let token = if response.data.connect_token.is_empty() {
         response.data.token
@@ -495,31 +703,32 @@ async fn process_authentication_response(
     };
     if token.is_empty() {
         flows.remove(&key);
-        return Err(Error::Protocol(
-            "aTrust flow authorization returned no connection token".into(),
-        ));
+        tracing::warn!(
+            destination = %key.destination,
+            "aTrust flow authorization returned no connection token"
+        );
+        return Ok(());
     }
-    let flow = flows
-        .get_mut(&key)
-        .ok_or_else(|| Error::Protocol("aTrust flow disappeared during authorization".into()))?;
+    let Some(flow) = flows.get_mut(&key) else {
+        return Ok(());
+    };
     if flow.auth_id != auth_id {
-        return Err(Error::Protocol(
-            "aTrust flow authorization identifier mismatch".into(),
-        ));
+        tracing::debug!(auth_id, "ignoring superseded aTrust flow authorization");
+        return Ok(());
     }
     for packet in &flow.pending {
         write_data_packet(tls, &token, packet).await?;
     }
     flow.pending.clear();
     flow.token = Some(token);
+    flow.last_activity = tokio::time::Instant::now();
     Ok(())
 }
 
-async fn write_data_packet(
-    tls: &mut TlsStream<TcpStream>,
-    token: &str,
-    packet: &[u8],
-) -> Result<(), Error> {
+async fn write_data_packet<W>(tls: &mut W, token: &str, packet: &[u8]) -> Result<(), Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let token_length = u8::try_from(token.len())
         .map_err(|_| Error::Protocol("aTrust flow token is too large".into()))?;
     let packet_length = u16::try_from(packet.len())
@@ -530,11 +739,13 @@ async fn write_data_packet(
     frame.extend_from_slice(&[0, 0, 1]);
     frame.extend_from_slice(&packet_length.to_be_bytes());
     frame.extend_from_slice(packet);
-    tls.write_all(&frame).await?;
-    Ok(())
+    write_with_timeout(tls, &frame).await
 }
 
-async fn read_frame(tls: &mut TlsStream<TcpStream>) -> Result<Frame, Error> {
+async fn read_frame<R>(tls: &mut R) -> Result<Frame, Error>
+where
+    R: AsyncRead + Unpin,
+{
     loop {
         let mut header = [0_u8; 2];
         tls.read_exact(&mut header).await?;
@@ -898,6 +1109,108 @@ mod tests {
         );
         assert!(extract_vips(b"not json").is_empty());
         assert!(extract_vips(br#"{"data":{"vip":""}}"#).is_empty());
+    }
+
+    async fn read_auth_request(gateway: &mut (impl AsyncRead + Unpin)) -> serde_json::Value {
+        let mut header = [0_u8; 4];
+        gateway.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[..2], [VERSION, AUTH_REQUEST]);
+        let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+        let mut payload = vec![0_u8; length];
+        gateway.read_exact(&mut payload).await.unwrap();
+        serde_json::from_slice(&payload).unwrap()
+    }
+
+    #[tokio::test]
+    async fn node_survives_rejected_flow_authorization() {
+        let (gateway, node_side) = tokio::io::duplex(65536);
+        let (mut gateway_read, mut gateway_write) = tokio::io::split(gateway);
+        let settings = L3Settings {
+            sid: "sid".into(),
+            device_id: "device".into(),
+            connection_id: "connection".into(),
+            sign_key: vec![0xab; 32],
+            expected_vip: None,
+        };
+        let (commands_sender, commands_receiver) = mpsc::channel(16);
+        let (incoming_sender, mut incoming_receiver) = mpsc::channel(16);
+        let node = tokio::spawn(node_loop(
+            node_side,
+            settings,
+            commands_receiver,
+            incoming_sender,
+        ));
+
+        let packet = ipv4_packet(6, 1000, 443);
+        let meta = parse_packet_meta(&packet).unwrap();
+        let command = || PacketCommand {
+            packet: packet.clone(),
+            meta: meta.clone(),
+            app_id: "app".into(),
+        };
+
+        commands_sender.send(command()).await.unwrap();
+        let first = read_auth_request(&mut gateway_read).await;
+        assert_eq!(first["conntrackHash"], 1);
+
+        // Reject the flow: the node must survive and drop only that flow.
+        let rejection = br#"{"code":7,"message":"denied","data":{"conntrackHash":1}}"#;
+        let mut frame = vec![VERSION, AUTH_RESPONSE, 0x01];
+        frame.extend_from_slice(&u16::try_from(rejection.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(rejection);
+        gateway_write.write_all(&frame).await.unwrap();
+
+        // Frames are handled in order, so receiving this data packet proves
+        // the rejection has been processed.
+        let inbound = ipv4_packet(6, 443, 1000);
+        let mut data_frame = vec![VERSION, DATA_RESPONSE];
+        data_frame.extend_from_slice(&u16::try_from(inbound.len()).unwrap().to_be_bytes());
+        data_frame.extend_from_slice(&inbound);
+        gateway_write.write_all(&data_frame).await.unwrap();
+        assert_eq!(incoming_receiver.recv().await.unwrap(), inbound);
+
+        // The same 5-tuple retries with a fresh authorization on new traffic.
+        commands_sender.send(command()).await.unwrap();
+        let second = read_auth_request(&mut gateway_read).await;
+        assert_eq!(second["conntrackHash"], 2);
+
+        drop(commands_sender);
+        node.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tunnel_stream_survives_unroutable_packets() {
+        let parsed = super::super::ParsedResources::default();
+        let settings = L3Settings {
+            sid: "sid".into(),
+            device_id: "device".into(),
+            connection_id: "connection".into(),
+            sign_key: vec![0xab; 32],
+            expected_vip: None,
+        };
+        let (mut application, bridge) = tokio::io::duplex(65536);
+        let tunnel = tokio::spawn(run_l3(
+            bridge,
+            parsed,
+            std::collections::BTreeMap::new(),
+            settings,
+        ));
+
+        // An IPv6 router solicitation (unsupported), an IGMP packet
+        // (unsupported protocol), and an unmatched IPv4 packet must all be
+        // dropped without stopping the tunnel.
+        let mut ipv6 = vec![0x60, 0, 0, 0, 0, 8, 58, 255];
+        ipv6.extend_from_slice(&[0_u8; 32]);
+        ipv6.extend_from_slice(&[133, 0, 0, 0, 0, 0, 0, 0]);
+        application.write_all(&ipv6).await.unwrap();
+        application.write_all(&ipv4_packet(2, 0, 0)).await.unwrap();
+        application
+            .write_all(&ipv4_packet(6, 1000, 443))
+            .await
+            .unwrap();
+
+        drop(application);
+        tunnel.await.unwrap().unwrap();
     }
 
     #[tokio::test]
