@@ -392,8 +392,7 @@ async fn gateway_exclusions(config: &Config) -> Vec<std::net::IpAddr> {
     }
     match tokio::net::lookup_host((config.server_address.as_str(), config.server_port)).await {
         Ok(addresses) => {
-            let mut resolved: Vec<std::net::IpAddr> =
-                addresses.map(|socket| socket.ip()).collect();
+            let mut resolved: Vec<std::net::IpAddr> = addresses.map(|socket| socket.ip()).collect();
             resolved.sort_unstable();
             resolved.dedup();
             if resolved.is_empty() {

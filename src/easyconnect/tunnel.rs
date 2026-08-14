@@ -51,7 +51,10 @@ impl EasyConnectClient {
                     hex::encode(reply)
                 )));
             }
-            Ok((Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]), connection))
+            Ok((
+                Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]),
+                connection,
+            ))
         };
         let (ip, connection) = tokio::time::timeout(HANDSHAKE_TIMEOUT, request_ip)
             .await
@@ -221,10 +224,7 @@ struct TunnelSession {
     client_ip: Ipv4Addr,
 }
 
-async fn tunnel_connection(
-    session: &TunnelSession,
-    command: u8,
-) -> Result<LegacyTlsStream, Error> {
+async fn tunnel_connection(session: &TunnelSession, command: u8) -> Result<LegacyTlsStream, Error> {
     let handshake = async {
         let mut connection = LegacyTlsStream::connect(&session.server_host).await?;
         let mut reversed_ip = session.client_ip.octets();

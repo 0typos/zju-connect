@@ -221,7 +221,10 @@ async fn forward_outbound_packet(
         }
     };
     let Ok(protocol) = protocol_match(meta.key.protocol) else {
-        tracing::trace!(protocol = meta.key.protocol, "dropping unsupported IP protocol");
+        tracing::trace!(
+            protocol = meta.key.protocol,
+            "dropping unsupported IP protocol"
+        );
         return;
     };
     let resource = parsed.resources.ip.iter().rev().find(|resource| {
@@ -283,7 +286,11 @@ async fn forward_outbound_packet(
     }
 
     let handle = nodes.get(&group).expect("node was just ensured");
-    match handle.commands.try_send(PacketCommand { packet, meta, app_id }) {
+    match handle.commands.try_send(PacketCommand {
+        packet,
+        meta,
+        app_id,
+    }) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
             tracing::trace!(group, "dropping packet: node queue is full");

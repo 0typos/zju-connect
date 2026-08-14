@@ -79,7 +79,13 @@ pub struct Config {
 
 impl std::fmt::Debug for Config {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redact = |value: &str| if value.is_empty() { "\"\"" } else { "\"<redacted>\"" };
+        let redact = |value: &str| {
+            if value.is_empty() {
+                "\"\""
+            } else {
+                "\"<redacted>\""
+            }
+        };
         formatter
             .debug_struct("Config")
             .field("protocol", &self.protocol)
@@ -87,7 +93,10 @@ impl std::fmt::Debug for Config {
             .field("server_port", &self.server_port)
             .field("username", &self.username)
             .field("password", &format_args!("{}", redact(&self.password)))
-            .field("totp_secret", &format_args!("{}", redact(&self.totp_secret)))
+            .field(
+                "totp_secret",
+                &format_args!("{}", redact(&self.totp_secret)),
+            )
             .field("socks_bind", &self.socks_bind)
             .field("socks_user", &self.socks_user)
             .field(
@@ -100,10 +109,7 @@ impl std::fmt::Debug for Config {
             .field("tun_mode", &self.tun_mode)
             .field("add_route", &self.add_route)
             .field("proxy_all", &self.proxy_all)
-            .field(
-                "sign_key",
-                &self.sign_key.as_deref().map(|_| "<redacted>"),
-            )
+            .field("sign_key", &self.sign_key.as_deref().map(|_| "<redacted>"))
             .field(
                 "cert_password",
                 &format_args!("{}", redact(&self.cert_password)),

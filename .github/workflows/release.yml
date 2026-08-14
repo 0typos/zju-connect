@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      # Cross-compiles on the native x86_64 host (no QEMU) and attaches a
+      # tar.gz of the release binary to the GitHub release.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: zju-connect
+          target: ${{ matrix.target }}
+          archive: zju-connect-$target
+          token: ${{ secrets.GITHUB_TOKEN }}

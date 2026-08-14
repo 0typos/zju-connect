@@ -4,7 +4,7 @@ An asynchronous Rust library and Linux CLI for connecting to Sangfor EasyConnect
 
 > This software is provided as-is. VPN software changes system routes and handles sensitive credentials. Review the configuration and use it at your own risk.
 
-This branch is a ground-up Rust conversion of the original Go project. Cargo is the authoritative build; the old Go sources remain temporarily as a protocol reference and are not part of the Rust/Linux build.
+This is a ground-up Rust conversion of the original Go project. Cargo is the only build; the Go sources have been removed (their history remains in the pre-port git tags for protocol reference).
 
 ## Current support
 
@@ -118,11 +118,13 @@ cp config.toml.example config.toml
 docker compose up --build
 ```
 
+Because the proxies default to `127.0.0.1`, a published container port cannot reach them. For Docker, set the binds to `0.0.0.0` in `config.toml` and either configure `socks_user`/`socks_password` or set `allow_open_proxy = true` (the container's network namespace is isolated, and Docker only exposes the ports you publish).
+
 ## Security notes
 
-Sangfor appliances commonly use appliance-local certificates, and the original client does not validate the HTTPS certificate. The Rust EasyConnect and aTrust clients currently preserve that behavior. Use a trusted network path to the gateway.
+The authentication channel (which carries your credentials and the password-encryption key) verifies the gateway's TLS certificate by default. Sangfor appliances often use an appliance-local certificate; if yours does, set `insecure_skip_verify = true` — but only on a trusted network path, since it disables MITM protection. The data-plane tunnels keep the official client's behavior and do not validate certificates, as they carry only tunnel framing.
 
-The example proxy listeners bind to all interfaces. Bind them to `127.0.0.1`, configure SOCKS authentication, or enforce an equivalent firewall policy unless other hosts should be allowed to use your VPN session.
+The proxy listeners bind to `127.0.0.1` by default. Binding a non-loopback address requires either SOCKS/HTTP credentials (`socks_user`/`socks_password`) or an explicit `allow_open_proxy = true`, so the VPN is never exposed as an unauthenticated relay by accident.
 
 The custom TLS implementation is deliberately isolated to the legacy Sangfor `L3IP` transport and supports only TLS 1.1 with `TLS_RSA_WITH_RC4_128_SHA`, as required by that protocol. It must not be reused as a general TLS implementation.
 

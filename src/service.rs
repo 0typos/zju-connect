@@ -111,7 +111,10 @@ impl Connector {
             return;
         }
         if let Ok(mut cache) = self.dns_cache.lock() {
-            cache.insert(host.to_owned(), (addresses.to_vec(), Instant::now() + self.dns_ttl));
+            cache.insert(
+                host.to_owned(),
+                (addresses.to_vec(), Instant::now() + self.dns_ttl),
+            );
         }
     }
 
@@ -485,7 +488,9 @@ async fn handle_http(
                   Connection: close\r\nContent-Length: 0\r\n\r\n",
             )
             .await?;
-        return Err(Error::Authentication("HTTP proxy authentication failed".into()));
+        return Err(Error::Authentication(
+            "HTTP proxy authentication failed".into(),
+        ));
     }
 
     if method.eq_ignore_ascii_case("CONNECT") {
@@ -795,7 +800,10 @@ mod tests {
         let good = format!("GET http://x/ HTTP/1.1\r\nProxy-Authorization: Basic {token}\r\n");
         assert!(proxy_auth_ok(&good, Some(&credentials)));
         assert!(proxy_auth_ok("GET http://x/ HTTP/1.1\r\n", None));
-        assert!(!proxy_auth_ok("GET http://x/ HTTP/1.1\r\n", Some(&credentials)));
+        assert!(!proxy_auth_ok(
+            "GET http://x/ HTTP/1.1\r\n",
+            Some(&credentials)
+        ));
         assert!(!proxy_auth_ok(
             "GET http://x/ HTTP/1.1\r\nProxy-Authorization: Basic wrong\r\n",
             Some(&credentials)
