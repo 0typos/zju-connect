@@ -49,7 +49,7 @@ auth_type = "auth/psw"
 login_domain = "Radius"
 tcp_tunnel_mode = false
 skip_tcp_tunnel_wait = false
-update_best_nodes_interval = 300
+# update_best_nodes_interval is not implemented yet; setting it fails validation.
 
 # Optional aTrust session reuse/debug fields may be set when needed. sid reuse
 # also requires device_id and an existing resource_file:

@@ -188,17 +188,23 @@ async fn prompt(message: &str) -> Result<String, Error> {
 async fn main() {
     if let Err(error) = run().await {
         eprintln!("zju-connect: {error}");
-        std::process::exit(1);
+        std::process::exit(exit_code(&error));
+    }
+}
+
+/// Map an error to a process exit code so supervisors can distinguish a
+/// configuration mistake (2) or an authentication failure (3), which will not
+/// succeed on restart, from a transient runtime failure (1).
+fn exit_code(error: &Error) -> i32 {
+    match error {
+        Error::Config(_) => 2,
+        Error::Authentication(_) | Error::UnsupportedAuthentication(_) => 3,
+        _ => 1,
     }
 }
 
 async fn run() -> Result<(), Error> {
     let cli = Cli::parse();
-    let filter = if cli.verbose { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()))
-        .with_target(false)
-        .init();
 
     let config = if let Some(path) = &cli.config {
         Config::from_file(path).await?
@@ -233,6 +239,23 @@ async fn run() -> Result<(), Error> {
         }
     };
     config.validate()?;
+
+    let filter = if config.debug_dump {
+        "trace"
+    } else if cli.verbose {
+        "debug"
+    } else {
+        "info"
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()))
+        .with_target(false)
+        .init();
+
+    if cli.config.is_some() {
+        tracing::debug!("settings loaded from --config; command-line connection flags are ignored");
+    }
+
     if cli.check_config {
         println!("configuration is valid");
         return Ok(());
@@ -314,11 +337,9 @@ async fn run_atrust_tun_services(
             ));
         }
     };
-    let routes = if config.add_route || proxy_enabled {
-        info.resources.routed_networks()
-    } else {
-        Vec::new()
-    };
+    // The aTrust TUN captures traffic by the gateway's resource networks, so
+    // those routes are always required here; add_route does not gate them.
+    let routes = info.resources.routed_networks();
     let exclude = gateway_exclusions(&config).await;
     let l3 = client.open_l3().await?;
     let tun = create_tun(
@@ -332,7 +353,7 @@ async fn run_atrust_tun_services(
     .await?;
     let connector = Arc::new(Connector::new(
         Policy::new(info.resources.clone(), config.proxy_all),
-        configured_remote_dns(&config, &info),
+        dns_config(&config, &info),
         tun.interface(),
         config
             .custom_dns
@@ -397,14 +418,39 @@ fn configured_remote_dns(config: &Config, info: &ConnectionInfo) -> Option<std::
     if config.disable_remote_dns {
         return None;
     }
-    match config.remote_dns_server {
-        zju_connect::config::RemoteDns::Address(address) => Some(address),
+    resolve_dns_setting(&config.remote_dns_server, info, 0)
+}
+
+fn configured_secondary_dns(config: &Config, info: &ConnectionInfo) -> Option<std::net::IpAddr> {
+    if config.disable_remote_dns {
+        return None;
+    }
+    resolve_dns_setting(&config.secondary_dns_server, info, 1)
+}
+
+/// Resolve a DNS setting to an address, mapping the `auto` keyword to the
+/// gateway-supplied server at `auto_index`.
+fn resolve_dns_setting(
+    setting: &zju_connect::config::RemoteDns,
+    info: &ConnectionInfo,
+    auto_index: usize,
+) -> Option<std::net::IpAddr> {
+    match setting {
+        zju_connect::config::RemoteDns::Address(address) => Some(*address),
         zju_connect::config::RemoteDns::Keyword(
             zju_connect::config::RemoteDnsKeyword::Disabled,
         ) => None,
         zju_connect::config::RemoteDns::Keyword(zju_connect::config::RemoteDnsKeyword::Auto) => {
-            info.dns_servers.first().copied()
+            info.dns_servers.get(auto_index).copied()
         }
+    }
+}
+
+fn dns_config(config: &Config, info: &ConnectionInfo) -> zju_connect::service::DnsConfig {
+    zju_connect::service::DnsConfig {
+        remote_dns: configured_remote_dns(config, info),
+        secondary_dns: configured_secondary_dns(config, info),
+        ttl: std::time::Duration::from_secs(config.dns_ttl),
     }
 }
 
@@ -468,12 +514,22 @@ async fn run_easyconnect_services(
             ));
         }
     };
-    let routes = if config.add_route || proxy_enabled {
+    // In TUN mode the OS routes traffic into the interface, so routes are
+    // required: add_route installs every gateway network, otherwise the ZJU
+    // default. In proxy-only mode the connector installs per-destination /32
+    // routes on demand, so no host-wide routes are added unless add_route asks.
+    let routes = if config.tun_mode {
+        if config.add_route {
+            info.resources.routed_networks()
+        } else if config.disable_zju_config {
+            Vec::new()
+        } else {
+            vec!["10.0.0.0/8".parse().expect("valid constant")]
+        }
+    } else if config.add_route {
         info.resources.routed_networks()
-    } else if config.disable_zju_config {
-        Vec::new()
     } else {
-        vec!["10.0.0.0/8".parse().expect("valid constant")]
+        Vec::new()
     };
     let exclude = gateway_exclusions(&config).await;
     let l3 = client.open_l3().await?;
@@ -488,7 +544,7 @@ async fn run_easyconnect_services(
     .await?;
     let connector = Arc::new(Connector::new(
         Policy::new(info.resources.clone(), config.proxy_all),
-        configured_remote_dns(&config, &info),
+        dns_config(&config, &info),
         tun.interface(),
         config
             .custom_dns

@@ -68,7 +68,7 @@ pub struct Config {
     pub oauth2_code: Option<String>,
     pub client_data_file: Option<String>,
     pub resource_file: Option<String>,
-    pub update_best_nodes_interval: u64,
+    pub update_best_nodes_interval: Option<u64>,
     pub sid: Option<String>,
     pub device_id: Option<String>,
     pub sign_key: Option<String>,
@@ -126,7 +126,7 @@ impl Default for Config {
             oauth2_code: None,
             client_data_file: None,
             resource_file: None,
-            update_best_nodes_interval: 300,
+            update_best_nodes_interval: None,
             sid: None,
             device_id: None,
             sign_key: None,
@@ -218,12 +218,30 @@ impl Config {
                     "aTrust sid reuse requires device_id and resource_file".into(),
                 ));
             }
+            if !self.custom_proxy_domain.is_empty() {
+                return Err(Error::Config(
+                    "custom_proxy_domain is not supported for aTrust; its resources are gateway-defined".into(),
+                ));
+            }
+        }
+        if self.update_best_nodes_interval.is_some() {
+            return Err(Error::Config(
+                "update_best_nodes_interval is not implemented in the Rust port yet".into(),
+            ));
         }
         if self.tun_mode && self.fake_ip && !self.dns_hijack {
             return Err(Error::Config(
                 "fake_ip requires dns_hijack when tun_mode is enabled".into(),
             ));
         }
+        self.reject_unsupported_features()?;
+        for domain in &self.custom_proxy_domain {
+            validate_domain(domain)?;
+        }
+        Ok(())
+    }
+
+    fn reject_unsupported_features(&self) -> Result<(), Error> {
         let unsupported = [
             (self.shadowsocks_url.as_deref(), "shadowsocks_url"),
             (self.dial_direct_proxy.as_deref(), "dial_direct_proxy"),
@@ -250,9 +268,6 @@ impl Config {
                 "EasyConnect TCP tunnel mode, DNS hijacking, fake IP, interface auto-detection, and port forwarding are not implemented in the Rust port yet"
                     .into(),
             ));
-        }
-        for domain in &self.custom_proxy_domain {
-            validate_domain(domain)?;
         }
         Ok(())
     }
@@ -403,6 +418,22 @@ mod tests {
             ..Config::default()
         };
         acknowledged.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_unimplemented_and_unsupported_keys() {
+        let interval = Config {
+            update_best_nodes_interval: Some(300),
+            ..Config::default()
+        };
+        assert!(interval.validate().is_err());
+
+        let atrust_custom = Config {
+            protocol: Protocol::Atrust,
+            custom_proxy_domain: vec!["example.com".into()],
+            ..Config::default()
+        };
+        assert!(atrust_custom.validate().is_err());
     }
 
     #[test]

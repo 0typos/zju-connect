@@ -1,12 +1,12 @@
 //! Linux proxy services backed by the VPN TUN interface.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     process::Stdio,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -56,27 +56,88 @@ pub struct ProxyConfig {
     pub http_bind: Option<String>,
 }
 
+/// DNS servers and cache lifetime for VPN-routed name resolution.
+#[derive(Clone, Copy, Debug)]
+pub struct DnsConfig {
+    pub remote_dns: Option<IpAddr>,
+    pub secondary_dns: Option<IpAddr>,
+    pub ttl: Duration,
+}
+
+type DnsCache = Arc<Mutex<HashMap<String, (Vec<IpAddr>, Instant)>>>;
+
 #[derive(Clone, Debug)]
 pub struct Connector {
     policy: Policy,
     remote_dns: Option<IpAddr>,
+    secondary_dns: Option<IpAddr>,
     interface: String,
     custom_dns: BTreeMap<String, IpAddr>,
+    dns_ttl: Duration,
+    dns_cache: DnsCache,
 }
 
 impl Connector {
     pub fn new(
         policy: Policy,
-        remote_dns: Option<IpAddr>,
+        dns: DnsConfig,
         interface: impl Into<String>,
         custom_dns: BTreeMap<String, IpAddr>,
     ) -> Self {
+        let DnsConfig {
+            remote_dns,
+            secondary_dns,
+            ttl,
+        } = dns;
         Self {
             policy,
             remote_dns,
+            secondary_dns,
             interface: interface.into(),
             custom_dns,
+            dns_ttl: ttl,
+            dns_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn cached(&self, host: &str) -> Option<Vec<IpAddr>> {
+        let cache = self.dns_cache.lock().ok()?;
+        let (addresses, expiry) = cache.get(host)?;
+        (*expiry > Instant::now()).then(|| addresses.clone())
+    }
+
+    fn store_cache(&self, host: &str, addresses: &[IpAddr]) {
+        if self.dns_ttl.is_zero() {
+            return;
+        }
+        if let Ok(mut cache) = self.dns_cache.lock() {
+            cache.insert(host.to_owned(), (addresses.to_vec(), Instant::now() + self.dns_ttl));
+        }
+    }
+
+    async fn resolve_via_vpn(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, Error> {
+        if let Some(addresses) = self.cached(host) {
+            return Ok(addresses);
+        }
+        let addresses = match self.remote_dns {
+            Some(primary) => {
+                add_host_route(primary, &self.interface).await?;
+                match resolve_dns(host, primary).await {
+                    Ok(addresses) => addresses,
+                    Err(primary_error) => match self.secondary_dns {
+                        Some(secondary) => {
+                            tracing::debug!(%primary_error, "primary VPN DNS failed; trying secondary");
+                            add_host_route(secondary, &self.interface).await?;
+                            resolve_dns(host, secondary).await?
+                        }
+                        None => return Err(primary_error),
+                    },
+                }
+            }
+            None => system_resolve(host, port).await?,
+        };
+        self.store_cache(host, &addresses);
+        Ok(addresses)
     }
 
     /// Resolve a destination according to VPN policy and establish a TCP stream.
@@ -105,13 +166,7 @@ impl Connector {
         let mut addresses = if let Some(address) = self.custom_dns.get(&normalized) {
             vec![*address]
         } else if route == Route::Vpn {
-            match self.remote_dns {
-                Some(server) => {
-                    add_host_route(server, &self.interface).await?;
-                    resolve_dns(&normalized, server).await?
-                }
-                None => system_resolve(&normalized, port).await?,
-            }
+            self.resolve_via_vpn(&normalized, port).await?
         } else {
             system_resolve(&normalized, port).await?
         };
@@ -582,24 +637,35 @@ async fn resolve_dns(host: &str, server: IpAddr) -> Result<Vec<IpAddr>, Error> {
         "[::]:0"
     };
     let socket = UdpSocket::bind(bind).await?;
-    socket.send_to(&query, SocketAddr::new(server, 53)).await?;
+    // Connect so the kernel drops datagrams from any peer other than the
+    // resolver, closing the off-path spoofing window to the query ID alone.
+    socket.connect(SocketAddr::new(server, 53)).await?;
+    socket.send(&query).await?;
+
+    let deadline = tokio::time::Instant::now() + DNS_TIMEOUT;
     let mut response = vec![0_u8; 4096];
-    let length = tokio::time::timeout(DNS_TIMEOUT, socket.recv(&mut response))
-        .await
-        .map_err(|_| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("DNS query to {server} timed out"),
-            ))
-        })??;
-    response.truncate(length);
-    let addresses = parse_dns_response(id, &response)?;
-    if addresses.is_empty() {
-        Err(Error::Protocol(format!(
-            "remote DNS returned no address for {host}"
-        )))
-    } else {
-        Ok(addresses)
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let length = tokio::time::timeout(remaining, socket.recv(&mut response))
+            .await
+            .map_err(|_| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("DNS query to {server} timed out"),
+                ))
+            })??;
+        // A response whose ID does not match ours is stale or spoofed; keep
+        // reading until the deadline instead of failing the whole query.
+        match parse_dns_response(id, &response[..length]) {
+            Ok(addresses) if addresses.is_empty() => {
+                return Err(Error::Protocol(format!(
+                    "remote DNS returned no address for {host}"
+                )));
+            }
+            Ok(addresses) => return Ok(addresses),
+            Err(_) if tokio::time::Instant::now() < deadline => {}
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -772,7 +838,11 @@ mod tests {
     fn direct_connector() -> Arc<Connector> {
         Arc::new(Connector::new(
             Policy::new(Resources::default(), false),
-            None,
+            DnsConfig {
+                remote_dns: None,
+                secondary_dns: None,
+                ttl: Duration::ZERO,
+            },
             "unused",
             BTreeMap::new(),
         ))
