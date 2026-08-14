@@ -1222,6 +1222,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_ip_packet_reassembles_across_reads() {
+        let mut packet = ipv4_packet(6, 5000, 80);
+        packet.resize(40, 0);
+        packet[2..4].copy_from_slice(&40_u16.to_be_bytes());
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let expected = packet.clone();
+        let sender = tokio::spawn(async move {
+            for chunk in expected.chunks(5) {
+                writer.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        assert_eq!(read_ip_packet(&mut reader).await.unwrap(), packet);
+        sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_ip_packet_rejects_bad_version() {
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        writer.write_all(&[0x00, 0, 0, 0]).await.unwrap();
+        assert!(read_ip_packet(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
     async fn tunnel_authentication_returns_negotiated_vip() {
         let (mut gateway, mut client) = tokio::io::duplex(4096);
         let server = tokio::spawn(async move {

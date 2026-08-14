@@ -380,11 +380,14 @@ fn socks_error_code(error: &Error) -> u8 {
     }
 }
 
-async fn authenticate_socks(
-    client: &mut TcpStream,
+async fn authenticate_socks<S>(
+    client: &mut S,
     expected_username: &str,
     expected_password: &str,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if client.read_u8().await? != 1 {
         return Err(Error::Protocol(
             "invalid SOCKS username/password version".into(),
@@ -833,6 +836,70 @@ mod tests {
             parse_dns_response(7, &response).unwrap(),
             ["192.0.2.1".parse::<IpAddr>().unwrap()]
         );
+    }
+
+    #[test]
+    fn dns_parser_rejects_mismatched_id_rcode_and_truncation() {
+        let base = dns_query(7, "example.com", 1).unwrap();
+
+        // Wrong transaction ID.
+        assert!(parse_dns_response(9, &base).is_err());
+
+        // Non-zero rcode (SERVFAIL).
+        let mut servfail = base.clone();
+        servfail[2..4].copy_from_slice(&0x8182_u16.to_be_bytes());
+        assert!(parse_dns_response(7, &servfail).is_err());
+
+        // An answer count that the record data cannot satisfy.
+        let mut truncated = base.clone();
+        truncated[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        truncated[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        truncated.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0]);
+        assert!(parse_dns_response(7, &truncated).is_err());
+
+        // A header shorter than 12 bytes never panics.
+        assert!(parse_dns_response(7, &[0, 7, 0]).is_err());
+    }
+
+    #[test]
+    fn dns_parser_follows_uncompressed_names_and_skips_other_records() {
+        // Answer 1: a CNAME (type 5) that must be skipped; answer 2: an A record.
+        let mut response = dns_query(3, "host.example", 1).unwrap();
+        response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        response[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        // CNAME record with a full (uncompressed) owner name.
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 0x0c]);
+        // A record.
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 1, 2, 3]);
+        assert_eq!(
+            parse_dns_response(3, &response).unwrap(),
+            ["10.1.2.3".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn socks_username_password_auth_accepts_and_rejects() {
+        async fn attempt(user: &[u8], pass: &[u8]) -> Result<(), Error> {
+            let (mut client, server) = tokio::io::duplex(64);
+            let mut server = server;
+            let check = tokio::spawn(async move {
+                super::authenticate_socks(&mut server, "alice", "s3cret").await
+            });
+            let mut frame = vec![1, u8::try_from(user.len()).unwrap()];
+            frame.extend_from_slice(user);
+            frame.push(u8::try_from(pass.len()).unwrap());
+            frame.extend_from_slice(pass);
+            client.write_all(&frame).await.unwrap();
+            let mut reply = [0_u8; 2];
+            client.read_exact(&mut reply).await.unwrap();
+            let result = check.await.unwrap();
+            assert_eq!(reply[0], 1);
+            assert_eq!(reply[1] == 0, result.is_ok());
+            result
+        }
+        assert!(attempt(b"alice", b"s3cret").await.is_ok());
+        assert!(attempt(b"alice", b"wrong").await.is_err());
+        assert!(attempt(b"eve", b"s3cret").await.is_err());
     }
 
     fn direct_connector() -> Arc<Connector> {

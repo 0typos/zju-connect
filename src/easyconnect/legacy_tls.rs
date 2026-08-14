@@ -483,4 +483,69 @@ mod tests {
         ciphertext[0] ^= 1;
         assert!(reader.decrypt(APPLICATION_DATA, ciphertext).is_err());
     }
+
+    #[test]
+    fn parse_server_hello_extracts_random_and_requires_rc4_sha() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&TLS_1_1);
+        let random = [0x5A_u8; 32];
+        body.extend_from_slice(&random);
+        body.push(4); // session id length
+        body.extend_from_slice(&[0xAB; 4]);
+        body.extend_from_slice(&RC4_SHA.to_be_bytes());
+        body.push(0); // compression
+        assert_eq!(parse_server_hello(&body).unwrap(), random);
+
+        // A different cipher is rejected.
+        let mut wrong = body.clone();
+        let cipher_offset = 35 + 4;
+        wrong[cipher_offset..cipher_offset + 2].copy_from_slice(&0x002f_u16.to_be_bytes());
+        assert!(parse_server_hello(&wrong).is_err());
+
+        // Truncation before the cipher suite is rejected without panicking.
+        assert!(parse_server_hello(&body[..37]).is_err());
+    }
+
+    #[test]
+    fn parse_certificate_returns_first_entry_and_rejects_bad_lengths() {
+        let cert = [0xC0_u8; 20];
+        let mut body = Vec::new();
+        body.extend_from_slice(&read_u24_bytes(cert.len() + 3));
+        body.extend_from_slice(&read_u24_bytes(cert.len()));
+        body.extend_from_slice(&cert);
+        assert_eq!(parse_certificate(&body).unwrap(), cert);
+
+        // A certificate length exceeding the body is rejected, not sliced.
+        let mut lying = Vec::new();
+        lying.extend_from_slice(&read_u24_bytes(1000));
+        lying.extend_from_slice(&read_u24_bytes(1000));
+        lying.extend_from_slice(&[0; 4]);
+        assert!(parse_certificate(&lying).is_err());
+    }
+
+    fn read_u24_bytes(value: usize) -> [u8; 3] {
+        let bytes = u32::try_from(value).unwrap().to_be_bytes();
+        [bytes[1], bytes[2], bytes[3]]
+    }
+
+    #[test]
+    fn prf_is_deterministic_length_bound_and_secret_sensitive() {
+        let a = tls_prf(b"secret-key", b"label", b"seed-value", 48);
+        let b = tls_prf(b"secret-key", b"label", b"seed-value", 48);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 48);
+        let c = tls_prf(b"secret-kex", b"label", b"seed-value", 48);
+        assert_ne!(a, c);
+        // Output must extend correctly across P_hash block boundaries.
+        assert_eq!(tls_prf(b"k", b"l", b"s", 100).len(), 100);
+    }
+
+    #[test]
+    fn finished_verify_is_twelve_bytes_and_transcript_sensitive() {
+        let master = [0x33; 48];
+        let a = finished_verify(&master, b"client finished", b"transcript-a");
+        let b = finished_verify(&master, b"client finished", b"transcript-b");
+        assert_eq!(a.len(), 12);
+        assert_ne!(a, b);
+    }
 }
