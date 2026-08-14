@@ -42,10 +42,7 @@ impl EasyConnectClient {
 
         let request_ip = async {
             let mut connection = LegacyTlsStream::connect(&self.config.server_host()).await?;
-            let mut request = Vec::with_capacity(64);
-            request.extend_from_slice(&[0, 0, 0, 0]);
-            request.extend_from_slice(&token);
-            request.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+            let request = crate::wire::to_bytes(&crate::wire::EcIpRequest { token, _suffix: () })?;
             connection.write_all(&request).await?;
             let reply = connection.read_record().await?;
             if reply.len() < 8 || reply[0] != 0 {
@@ -230,11 +227,13 @@ async fn tunnel_connection(
 ) -> Result<LegacyTlsStream, Error> {
     let handshake = async {
         let mut connection = LegacyTlsStream::connect(&session.server_host).await?;
-        let mut request = Vec::with_capacity(64);
-        request.extend_from_slice(&[command, 0, 0, 0]);
-        request.extend_from_slice(&session.token);
-        request.extend_from_slice(&[0; 8]);
-        request.extend(session.client_ip.octets().into_iter().rev());
+        let mut reversed_ip = session.client_ip.octets();
+        reversed_ip.reverse();
+        let request = crate::wire::to_bytes(&crate::wire::EcTunnelRequest {
+            command,
+            token: session.token,
+            reversed_ip,
+        })?;
         connection.write_all(&request).await?;
         let reply = connection.read_record().await?;
         let expected = if command == 0x05 { 0x02 } else { 0x01 };

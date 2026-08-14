@@ -25,7 +25,6 @@ use super::{AtrustClient, split_endpoint};
 const VERSION: u8 = 0x05;
 const AUTH_REQUEST: u8 = 0x13;
 const AUTH_RESPONSE: u8 = 0x93;
-const DATA_REQUEST: u8 = 0x14;
 const DATA_RESPONSE: u8 = 0x94;
 const HEARTBEAT_REQUEST: u8 = 0x15;
 const HEARTBEAT_RESPONSE: u8 = 0x95;
@@ -552,9 +551,14 @@ where
                         "aTrust node stopped answering heartbeats".into(),
                     ));
                 }
-                if let Err(error) =
-                    write_with_timeout(&mut write, &[VERSION, HEARTBEAT_REQUEST, 0, 0]).await
-                {
+                let heartbeat = match crate::wire::to_bytes(&crate::wire::AtrustL3Header {
+                    command: HEARTBEAT_REQUEST,
+                    length: 0,
+                }) {
+                    Ok(frame) => frame,
+                    Err(error) => break Err(error),
+                };
+                if let Err(error) = write_with_timeout(&mut write, &heartbeat).await {
                     break Err(error);
                 }
                 outstanding_heartbeats += 1;
@@ -642,8 +646,10 @@ where
         tracing::warn!("aTrust flow authorization is too large");
         return Ok(());
     };
-    let mut frame = vec![VERSION, AUTH_REQUEST];
-    frame.extend_from_slice(&length.to_be_bytes());
+    let mut frame = crate::wire::to_bytes(&crate::wire::AtrustL3Header {
+        command: AUTH_REQUEST,
+        length,
+    })?;
     frame.extend_from_slice(&request);
     write_with_timeout(tls, &frame).await?;
     auth_flows.insert(auth_id, command.meta.key.clone());
@@ -733,11 +739,13 @@ where
         .map_err(|_| Error::Protocol("aTrust flow token is too large".into()))?;
     let packet_length = u16::try_from(packet.len())
         .map_err(|_| Error::Protocol("IP packet is too large".into()))?;
-    let mut frame = Vec::with_capacity(8 + token.len() + packet.len());
-    frame.extend_from_slice(&[VERSION, DATA_REQUEST, token_length]);
-    frame.extend_from_slice(token.as_bytes());
-    frame.extend_from_slice(&[0, 0, 1]);
-    frame.extend_from_slice(&packet_length.to_be_bytes());
+    let header = crate::wire::to_bytes(&crate::wire::AtrustDataHeader {
+        token_length,
+        token: token.as_bytes().to_vec(),
+        packet_length,
+    })?;
+    let mut frame = Vec::with_capacity(header.len() + packet.len());
+    frame.extend_from_slice(&header);
     frame.extend_from_slice(packet);
     write_with_timeout(tls, &frame).await
 }

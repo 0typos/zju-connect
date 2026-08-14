@@ -605,10 +605,14 @@ async fn resolve_dns(host: &str, server: IpAddr) -> Result<Vec<IpAddr>, Error> {
 
 fn dns_query(id: u16, host: &str, record_type: u16) -> Result<Vec<u8>, Error> {
     let mut query = Vec::with_capacity(512);
-    query.extend_from_slice(&id.to_be_bytes());
-    query.extend_from_slice(&0x0100_u16.to_be_bytes());
-    query.extend_from_slice(&1_u16.to_be_bytes());
-    query.extend_from_slice(&[0; 6]);
+    query.extend_from_slice(&crate::wire::to_bytes(&crate::wire::DnsHeader {
+        id,
+        flags: 0x0100,
+        questions: 1,
+        answers: 0,
+        authorities: 0,
+        additionals: 0,
+    })?);
     for label in host.trim_end_matches('.').split('.') {
         if label.is_empty() || label.len() > 63 {
             return Err(Error::Protocol(format!("invalid DNS name: {host}")));

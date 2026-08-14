@@ -14,6 +14,7 @@ pub mod resource;
 pub mod service;
 #[cfg(target_os = "linux")]
 pub mod tun;
+mod wire;
 
 use std::{net::IpAddr, pin::Pin};
 
