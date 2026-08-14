@@ -21,10 +21,10 @@ assignees: Mythologyli
 ---
 
 **软件版本**
-v0.4.0
+v0.1.0 (Rust)
 
-**使用环境**
-Windows 10 x64/Windows 11/Ubuntu 22.04/OpenWrt 22.03/Docker/...
+**Linux 使用环境**
+发行版、内核版本、CPU 架构，以及是否使用 Docker
 
 **服务端地址**
 rvpn.zju.edu.cn:443

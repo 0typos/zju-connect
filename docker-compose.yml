@@ -1,14 +1,16 @@
-version: '3'
-
 services:
   zju-connect:
     build:
       context: .
-    image: zju-connect
+    image: zju-connect-rust
     container_name: zju-connect
     restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
     ports:
-      - 1080:1080
-      - 1081:1081
+      - "1080:1080"
+      - "1081:1081"
     volumes:
-      - ./config.toml:/home/nonroot/config.toml
+      - ./config.toml:/etc/zju-connect/config.toml:ro

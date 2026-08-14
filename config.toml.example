@@ -1,68 +1,56 @@
+# Linux Rust client configuration. Empty proxy bind values disable that listener.
 protocol = "easyconnect" # "easyconnect" or "atrust"
 server_address = "rvpn.zju.edu.cn"
 server_port = 443
 username = "username"
 password = "password"
-disable_zju_config = false
-disable_zju_dns = false
-socks_bind = ":1080"
-socks_user = ""
-socks_passwd = ""
-http_bind = ":1081"
-shadowsocks_url = "" # "ss://aes-128-gcm:password@:1082"
-dial_direct_proxy = "" # "http://127.0.0.1:7890" or "socks://127.0.0.1:7890"
-tcp_tunnel_mode = false
-tun_mode = false
-add_route = false
-dns_ttl = 3600
-disable_keep_alive = false
-keep_alive_url = "" # "https://www.cnki.net/favicon.ico"
-zju_dns_server = "auto"
-secondary_dns_server = "auto"
-dns_server_bind = ""
-dns_hijack = false
-fake_ip = false
-debug_dump = false
-bind_interface = ""
-auto_detect_interface = false
 
-# Port forwarding
-port_forwarding = [
-#    { network_type = "tcp", bind_address = "127.0.0.1:9898", remote_address = "10.10.98.98:80" },
-#    { network_type = "tcp", bind_address = "127.0.0.1:9899", remote_address = "10.10.98.98:80" },
-#    { network_type = "udp", bind_address = "127.0.0.1:1053", remote_address = "10.10.0.21:53" }
+socks_bind = "0.0.0.0:1080"
+socks_user = ""
+socks_password = ""
+http_bind = "0.0.0.0:1081"
+
+tun_mode = false          # EasyConnect only; requires root or CAP_NET_ADMIN
+add_route = false
+proxy_all = false
+disable_remote_dns = false
+remote_dns_server = "auto"
+secondary_dns_server = "auto"
+dns_ttl = 3600
+
+disable_server_config = false
+skip_domain_resource = false
+disable_zju_config = false
+disable_multi_line = false
+disable_keep_alive = false
+debug_dump = false
+
+graph_code_file = "captcha.png"
+totp_secret = ""
+
+custom_proxy_domain = [
+#   "science.org",
 ]
 
 custom_dns = [
-#    { host_name = "appservice.zju.edu.cn", ip = "10.203.8.198"},
-#    { host_name = "www.cc98.org", ip = "10.10.98.98"}
+#   { host_name = "appservice.zju.edu.cn", ip = "10.203.8.198" },
 ]
 
-
-# EasyConnect specific settings
-totp_secret = ""
-cert_file = ""
-cert_password = ""
-disable_server_config = false
-skip_domain_resource = false
-disable_multi_line = false
-proxy_all = false
-custom_proxy_domain = [
-#    "science.org",
-#    "nature.com"
-]
-
-
-# aTrust specific settings
+# aTrust settings. Its SOCKS/HTTP TCP transport does not require root.
 auth_type = "auth/psw"
 login_domain = "Radius"
-client_data_file = "client_data.json"
-graph_code_file = "" # Optional: captcha image will open in browser if this left empty. If set, the program will save the captcha image to this file and ask user to input the code in terminal.
-cas_ticket = ""
-oauth2_code = ""
-phone = ""
+tcp_tunnel_mode = false
+skip_tcp_tunnel_wait = false
 update_best_nodes_interval = 300
-sid = ""
-device_id = ""
-sign_key = ""
-resource_file = ""
+
+# Optional aTrust session reuse/debug fields may be set when needed. sid reuse
+# also requires device_id and an existing resource_file:
+# sid = "..."
+# device_id = "..."
+# sign_key = "..."
+# resource_file = "resources.json"
+
+# These upstream features are intentionally rejected until their Rust ports land:
+# shadowsocks_url, dial_direct_proxy, dns_server_bind, keep_alive_url,
+# dns_hijack, fake_ip, bind_interface, auto_detect_interface, cert_file,
+# port_forwarding, CAS/OAuth login, and UDP forwarding.
