@@ -83,7 +83,7 @@ struct Cli {
     #[arg(long)]
     skip_tcp_tunnel_wait: bool,
 
-    #[arg(long, default_value = "0.0.0.0:1080")]
+    #[arg(long, default_value = "127.0.0.1:1080")]
     socks_bind: Option<String>,
 
     #[arg(long, default_value = "")]
@@ -92,8 +92,16 @@ struct Cli {
     #[arg(long, default_value = "", hide_default_value = true)]
     socks_password: String,
 
-    #[arg(long, default_value = "0.0.0.0:1081")]
+    #[arg(long, default_value = "127.0.0.1:1081")]
     http_bind: Option<String>,
+
+    /// Allow binding the proxies to a non-loopback address without credentials.
+    #[arg(long)]
+    allow_open_proxy: bool,
+
+    /// Skip TLS verification on the auth channel (self-signed gateways only).
+    #[arg(long)]
+    insecure_skip_verify: bool,
 
     #[arg(long)]
     disable_server_config: bool,
@@ -215,6 +223,8 @@ async fn run() -> Result<(), Error> {
             socks_user: cli.socks_user,
             socks_password: cli.socks_password,
             http_bind: cli.http_bind,
+            allow_open_proxy: cli.allow_open_proxy,
+            insecure_skip_verify: cli.insecure_skip_verify,
             disable_server_config: cli.disable_server_config,
             skip_domain_resource: cli.skip_domain_resource,
             tun_mode: cli.tun_mode,

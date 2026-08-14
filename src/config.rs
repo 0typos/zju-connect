@@ -28,6 +28,11 @@ pub struct Config {
     #[serde(alias = "socks_passwd")]
     pub socks_password: String,
     pub http_bind: Option<String>,
+    /// Permit binding the proxies to a non-loopback address without credentials.
+    pub allow_open_proxy: bool,
+    /// Skip TLS certificate verification on the authentication channel. Needed
+    /// for gateways with a self-signed certificate; disables MITM protection.
+    pub insecure_skip_verify: bool,
     pub shadowsocks_url: Option<String>,
     pub dial_direct_proxy: Option<String>,
     pub dns_server_bind: Option<String>,
@@ -82,10 +87,12 @@ impl Default for Config {
             password: String::new(),
             totp_secret: String::new(),
             graph_code_file: None,
-            socks_bind: Some("0.0.0.0:1080".into()),
+            socks_bind: Some("127.0.0.1:1080".into()),
             socks_user: String::new(),
             socks_password: String::new(),
-            http_bind: Some("0.0.0.0:1081".into()),
+            http_bind: Some("127.0.0.1:1081".into()),
+            allow_open_proxy: false,
+            insecure_skip_verify: false,
             shadowsocks_url: None,
             dial_direct_proxy: None,
             dns_server_bind: None,
@@ -159,9 +166,19 @@ impl Config {
                 "server_address must not include a URL scheme".into(),
             ));
         }
+        // A bare "host:port" in server_address is a common mistake; the port
+        // belongs in server_port. IPv6 literals legitimately contain colons.
+        if self.server_address.parse::<std::net::Ipv6Addr>().is_err()
+            && self.server_address.contains(':')
+        {
+            return Err(Error::Config(
+                "server_address must not include a port; set server_port instead".into(),
+            ));
+        }
         if self.server_port == 0 {
             return Err(Error::Config("server_port must not be zero".into()));
         }
+        self.validate_proxy_binds()?;
         if self
             .twf_id
             .as_deref()
@@ -236,6 +253,32 @@ impl Config {
         }
         for domain in &self.custom_proxy_domain {
             validate_domain(domain)?;
+        }
+        Ok(())
+    }
+
+    fn validate_proxy_binds(&self) -> Result<(), Error> {
+        if !self.socks_password.is_empty() && self.socks_user.is_empty() {
+            return Err(Error::Config(
+                "socks_password is set but socks_user is empty; both are required".into(),
+            ));
+        }
+        let has_credentials = !self.socks_user.is_empty();
+        for (bind, name) in [
+            (self.socks_bind.as_deref(), "socks_bind"),
+            (self.http_bind.as_deref(), "http_bind"),
+        ] {
+            let Some(bind) = bind.filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let address = bind.parse::<std::net::SocketAddr>().map_err(|_| {
+                Error::Config(format!("{name} must be a valid host:port address: {bind}"))
+            })?;
+            if !address.ip().is_loopback() && !has_credentials && !self.allow_open_proxy {
+                return Err(Error::Config(format!(
+                    "{name} listens on a non-loopback address ({bind}); set socks_user/socks_password or enable allow_open_proxy to expose the proxy"
+                )));
+            }
         }
         Ok(())
     }
@@ -324,8 +367,9 @@ mod tests {
     fn defaults_match_the_zju_service() {
         let config = Config::default();
         assert_eq!(config.server_host(), "rvpn.zju.edu.cn:443");
-        assert_eq!(config.socks_bind.as_deref(), Some("0.0.0.0:1080"));
-        assert_eq!(config.http_bind.as_deref(), Some("0.0.0.0:1081"));
+        assert_eq!(config.socks_bind.as_deref(), Some("127.0.0.1:1080"));
+        assert_eq!(config.http_bind.as_deref(), Some("127.0.0.1:1081"));
+        config.validate().unwrap();
     }
 
     #[test]
@@ -335,6 +379,54 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(config.server_host(), "[2001:db8::1]:443");
+    }
+
+    #[test]
+    fn rejects_open_proxy_bind_without_credentials() {
+        let open = Config {
+            socks_bind: Some("0.0.0.0:1080".into()),
+            ..Config::default()
+        };
+        assert!(open.validate().is_err());
+
+        let with_auth = Config {
+            socks_bind: Some("0.0.0.0:1080".into()),
+            socks_user: "user".into(),
+            socks_password: "pass".into(),
+            ..Config::default()
+        };
+        with_auth.validate().unwrap();
+
+        let acknowledged = Config {
+            socks_bind: Some("0.0.0.0:1080".into()),
+            allow_open_proxy: true,
+            ..Config::default()
+        };
+        acknowledged.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_socks_password_without_user() {
+        let config = Config {
+            socks_password: "secret".into(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unparsable_bind_and_server_port_in_address() {
+        let bad_bind = Config {
+            socks_bind: Some("not-an-address".into()),
+            ..Config::default()
+        };
+        assert!(bad_bind.validate().is_err());
+
+        let host_port = Config {
+            server_address: "vpn.example.edu:443".into(),
+            ..Config::default()
+        };
+        assert!(host_port.validate().is_err());
     }
 
     #[test]

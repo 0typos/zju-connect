@@ -10,6 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore as _;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
@@ -86,8 +87,10 @@ impl Connector {
     pub async fn connect_tcp(&self, host: &str, port: u16) -> Result<TcpStream, Error> {
         let host = host.trim_matches(['[', ']']);
         if let Ok(address) = host.parse::<IpAddr>() {
-            if self.policy.route_ip(address, port, ProtocolMatch::Tcp) == Route::Vpn {
-                add_host_route(address, &self.interface).await?;
+            match self.policy.route_ip(address, port, ProtocolMatch::Tcp) {
+                Route::Vpn => add_host_route(address, &self.interface).await?,
+                Route::Reject => return Err(rejected(&address.to_string())),
+                Route::Direct => {}
             }
             return connect_addresses([SocketAddr::new(address, port)]).await;
         }
@@ -96,7 +99,10 @@ impl Connector {
         let route = self
             .policy
             .route_domain(&normalized, port, ProtocolMatch::Tcp);
-        let addresses = if let Some(address) = self.custom_dns.get(&normalized) {
+        if route == Route::Reject {
+            return Err(rejected(&normalized));
+        }
+        let mut addresses = if let Some(address) = self.custom_dns.get(&normalized) {
             vec![*address]
         } else if route == Route::Vpn {
             match self.remote_dns {
@@ -110,6 +116,14 @@ impl Connector {
             system_resolve(&normalized, port).await?
         };
         if route == Route::Vpn {
+            // The tunnel carries IPv4 only; never route a resolved IPv6 address
+            // into it or connect to it directly under a VPN policy.
+            addresses.retain(IpAddr::is_ipv4);
+            if addresses.is_empty() {
+                return Err(Error::Protocol(format!(
+                    "{normalized} resolved to no IPv4 address reachable over the VPN"
+                )));
+            }
             for address in &addresses {
                 add_host_route(*address, &self.interface).await?;
             }
@@ -121,6 +135,12 @@ impl Connector {
         )
         .await
     }
+}
+
+fn rejected(destination: &str) -> Error {
+    Error::Protocol(format!(
+        "{destination} cannot be reached: proxy_all is set but the VPN tunnel is IPv4-only"
+    ))
 }
 
 #[async_trait]
@@ -137,6 +157,9 @@ impl TcpConnector for Connector {
 /// Returns a listener or connection-task error. At least one bind address must be set.
 pub async fn serve(config: ProxyConfig, connector: Arc<dyn TcpConnector>) -> Result<(), Error> {
     let mut services = JoinSet::new();
+    // The same credentials guard the SOCKS and HTTP listeners.
+    let credentials = (!config.socks_username.is_empty())
+        .then(|| (config.socks_username.clone(), config.socks_password.clone()));
     if let Some(bind) = config.socks_bind.filter(|bind| !bind.is_empty()) {
         let connector = Arc::clone(&connector);
         let username = config.socks_username;
@@ -144,7 +167,8 @@ pub async fn serve(config: ProxyConfig, connector: Arc<dyn TcpConnector>) -> Res
         services.spawn(async move { serve_socks(&bind, connector, username, password).await });
     }
     if let Some(bind) = config.http_bind.filter(|bind| !bind.is_empty()) {
-        services.spawn(async move { serve_http(&bind, connector).await });
+        let credentials = credentials.clone();
+        services.spawn(async move { serve_http(&bind, connector, credentials).await });
     }
     if services.is_empty() {
         return Err(Error::Config("no proxy listener is enabled".into()));
@@ -336,23 +360,34 @@ async fn send_socks_reply(client: &mut TcpStream, status: u8) -> Result<(), Erro
     Ok(())
 }
 
-async fn serve_http(bind: &str, connector: Arc<dyn TcpConnector>) -> Result<(), Error> {
+async fn serve_http(
+    bind: &str,
+    connector: Arc<dyn TcpConnector>,
+    credentials: Option<(String, String)>,
+) -> Result<(), Error> {
     let listener = TcpListener::bind(bind).await?;
+    let credentials = Arc::new(credentials);
     tracing::info!(bind, "HTTP proxy is listening");
     loop {
         let Some((stream, peer)) = accept(&listener).await else {
             continue;
         };
         let connector = Arc::clone(&connector);
+        let credentials = Arc::clone(&credentials);
         tokio::spawn(async move {
-            if let Err(error) = handle_http(stream, connector).await {
+            if let Err(error) = handle_http(stream, connector, credentials.as_ref().as_ref()).await
+            {
                 tracing::debug!(%peer, %error, "HTTP proxy connection failed");
             }
         });
     }
 }
 
-async fn handle_http(mut client: TcpStream, connector: Arc<dyn TcpConnector>) -> Result<(), Error> {
+async fn handle_http(
+    mut client: TcpStream,
+    connector: Arc<dyn TcpConnector>,
+    credentials: Option<&(String, String)>,
+) -> Result<(), Error> {
     let mut request = Vec::with_capacity(1024);
     let read_header = async {
         loop {
@@ -373,27 +408,44 @@ async fn handle_http(mut client: TcpStream, connector: Arc<dyn TcpConnector>) ->
         Err(_) => return Err(Error::Protocol("HTTP proxy header timed out".into())),
     };
     let header = std::str::from_utf8(&request[..header_end])
-        .map_err(|_| Error::Protocol("HTTP proxy header is not UTF-8".into()))?;
+        .map_err(|_| Error::Protocol("HTTP proxy header is not UTF-8".into()))?
+        .to_owned();
     let first_line = header
         .lines()
         .next()
         .ok_or_else(|| Error::Protocol("HTTP proxy request line is missing".into()))?;
     let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let target = parts.next().unwrap_or_default();
-    let version = parts.next().unwrap_or_default();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let target = parts.next().unwrap_or_default().to_owned();
+    let version = parts.next().unwrap_or_default().to_owned();
+
+    if !proxy_auth_ok(&header, credentials) {
+        client
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                  Proxy-Authenticate: Basic realm=\"zju-connect\"\r\n\
+                  Connection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await?;
+        return Err(Error::Authentication("HTTP proxy authentication failed".into()));
+    }
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        let (host, port) = parse_authority(target, 443)?;
+        let (host, port) = parse_authority(&target, 443)?;
         let mut upstream = connector.connect_tcp(&host, port).await?;
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
+        // Forward any bytes the client pipelined after the CONNECT header
+        // (e.g. a TLS ClientHello sent in the same segment).
+        if header_end < request.len() {
+            upstream.write_all(&request[header_end..]).await?;
+        }
         tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
         return Ok(());
     }
 
-    let url = url::Url::parse(target)
+    let url = url::Url::parse(&target)
         .map_err(|error| Error::Protocol(format!("invalid absolute proxy URL: {error}")))?;
     let host = url
         .host_str()
@@ -405,19 +457,44 @@ async fn handle_http(mut client: TcpStream, connector: Arc<dyn TcpConnector>) ->
         None => url.path().to_owned(),
     };
     let mut rewritten = format!("{method} {path} {version}\r\n");
-    for line in header
-        .lines()
-        .skip(1)
-        .filter(|line| !line.to_ascii_lowercase().starts_with("proxy-connection:"))
-    {
+    for line in header.lines().skip(1).filter(|line| {
+        let lower = line.to_ascii_lowercase();
+        // Strip hop-by-hop and proxy-only headers; a fresh Connection header
+        // is appended below.
+        !lower.starts_with("proxy-connection:")
+            && !lower.starts_with("proxy-authorization:")
+            && !lower.starts_with("connection:")
+    }) {
         rewritten.push_str(line);
         rewritten.push_str("\r\n");
     }
-    rewritten.push_str("\r\n");
+    // Absolute-form requests are only correct for the first request on the
+    // connection; force a single request/response exchange so a keep-alive
+    // client cannot send a second request to the wrong upstream.
+    rewritten.push_str("Connection: close\r\n\r\n");
     upstream.write_all(rewritten.as_bytes()).await?;
     upstream.write_all(&request[header_end..]).await?;
     tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     Ok(())
+}
+
+/// Check the `Proxy-Authorization` header against the configured credentials.
+/// Returns true when no credentials are required.
+fn proxy_auth_ok(header: &str, credentials: Option<&(String, String)>) -> bool {
+    let Some((username, password)) = credentials else {
+        return true;
+    };
+    let expected = BASE64.encode(format!("{username}:{password}"));
+    header.lines().skip(1).any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("proxy-authorization")
+            && value
+                .trim()
+                .strip_prefix("Basic ")
+                .is_some_and(|token| token.trim() == expected)
+    })
 }
 
 fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16), Error> {
@@ -639,6 +716,20 @@ mod tests {
     }
 
     #[test]
+    fn checks_http_proxy_basic_auth() {
+        let credentials = ("alice".to_owned(), "s3cret".to_owned());
+        let token = BASE64.encode("alice:s3cret");
+        let good = format!("GET http://x/ HTTP/1.1\r\nProxy-Authorization: Basic {token}\r\n");
+        assert!(proxy_auth_ok(&good, Some(&credentials)));
+        assert!(proxy_auth_ok("GET http://x/ HTTP/1.1\r\n", None));
+        assert!(!proxy_auth_ok("GET http://x/ HTTP/1.1\r\n", Some(&credentials)));
+        assert!(!proxy_auth_ok(
+            "GET http://x/ HTTP/1.1\r\nProxy-Authorization: Basic wrong\r\n",
+            Some(&credentials)
+        ));
+    }
+
+    #[test]
     fn maps_connect_errors_to_socks_codes() {
         use std::io::ErrorKind;
         let code = |kind| socks_error_code(&Error::Io(std::io::Error::from(kind)));
@@ -734,7 +825,7 @@ mod tests {
         let proxy = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_http(stream, direct_connector()).await.unwrap();
+            handle_http(stream, direct_connector(), None).await.unwrap();
         });
 
         let mut client = TcpStream::connect(proxy).await.unwrap();

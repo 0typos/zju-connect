@@ -5,12 +5,20 @@ server_port = 443
 username = "username"
 password = "password"
 
-socks_bind = "0.0.0.0:1080"
+# Proxies default to loopback. To expose them on a non-loopback address,
+# set socks_user/socks_password (enforced for SOCKS and HTTP) or, only if you
+# accept an unauthenticated relay into the VPN, set allow_open_proxy = true.
+socks_bind = "127.0.0.1:1080"
 socks_user = ""
 socks_password = ""
-http_bind = "0.0.0.0:1081"
+http_bind = "127.0.0.1:1081"
+allow_open_proxy = false
 
-tun_mode = false          # EasyConnect only; requires root or CAP_NET_ADMIN
+# The auth channel verifies the gateway certificate by default. Enable this
+# only for gateways with a self-signed certificate; it disables MITM protection.
+insecure_skip_verify = false
+
+tun_mode = false          # requires root or CAP_NET_ADMIN
 add_route = false
 proxy_all = false
 disable_remote_dns = false

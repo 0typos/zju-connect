@@ -6,6 +6,9 @@ use crate::resource::{DomainResource, IpResource, ProtocolMatch, Resources};
 pub enum Route {
     Vpn,
     Direct,
+    /// The destination must not be reached: it cannot traverse the IPv4-only
+    /// tunnel, but `proxy_all` forbids a direct connection.
+    Reject,
 }
 
 #[derive(Clone, Debug)]
@@ -24,7 +27,13 @@ impl Policy {
 
     pub fn route_ip(&self, address: IpAddr, port: u16, protocol: ProtocolMatch) -> Route {
         if address.is_ipv6() {
-            return Route::Direct;
+            // The tunnel is IPv4-only; under proxy_all a direct IPv6 connection
+            // would silently bypass the VPN, so fail closed instead.
+            return if self.proxy_all {
+                Route::Reject
+            } else {
+                Route::Direct
+            };
         }
         if self.proxy_all
             || self
@@ -161,6 +170,21 @@ mod tests {
         assert_eq!(
             policy().route_domain("mail.zju.edu.cn", 80, ProtocolMatch::Tcp),
             Route::Direct
+        );
+    }
+
+    #[test]
+    fn ipv6_is_direct_split_but_rejected_under_proxy_all() {
+        let v6 = "2001:db8::1".parse::<IpAddr>().unwrap();
+        assert_eq!(
+            policy().route_ip(v6, 443, ProtocolMatch::Tcp),
+            Route::Direct
+        );
+        let all = Policy::new(Resources::default(), true);
+        assert_eq!(all.route_ip(v6, 443, ProtocolMatch::Tcp), Route::Reject);
+        assert_eq!(
+            all.route_ip("1.1.1.1".parse().unwrap(), 443, ProtocolMatch::Tcp),
+            Route::Vpn
         );
     }
 }

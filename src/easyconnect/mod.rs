@@ -41,13 +41,19 @@ impl EasyConnectClient {
         config.validate()?;
         let http = HttpClient::builder()
             .cookie_store(true)
-            // Sangfor gateways commonly use an appliance-local certificate. This
-            // matches the official client and the original implementation.
-            .danger_accept_invalid_certs(true)
+            // The authentication channel carries the password-encryption key and
+            // credentials, so certificates are verified by default. Gateways with
+            // a self-signed certificate require insecure_skip_verify.
+            .danger_accept_invalid_certs(config.insecure_skip_verify)
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .user_agent(USER_AGENT)
             .build()?;
+        if config.insecure_skip_verify {
+            tracing::warn!(
+                "insecure_skip_verify is set; the authentication channel is exposed to MITM"
+            );
+        }
         let twf_id = config.twf_id.clone().filter(|value| !value.is_empty());
         Ok(Self {
             config,

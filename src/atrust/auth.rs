@@ -100,9 +100,16 @@ impl AuthSession {
         let base_url = Url::parse(&base)
             .map_err(|error| Error::Config(format!("invalid aTrust gateway URL: {error}")))?;
         let cookies = Arc::new(reqwest::cookie::Jar::default());
+        // The authentication channel fetches the RSA key that encrypts the
+        // password, so certificates are verified unless the user opts out.
+        if config.insecure_skip_verify {
+            tracing::warn!(
+                "insecure_skip_verify is set; the authentication channel is exposed to MITM"
+            );
+        }
         let http = Client::builder()
             .cookie_provider(Arc::clone(&cookies))
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(config.insecure_skip_verify)
             .timeout(std::time::Duration::from_secs(20))
             .build()?;
         Ok(Self {
