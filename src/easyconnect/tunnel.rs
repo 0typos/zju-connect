@@ -2,6 +2,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     pin::Pin,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -18,6 +19,12 @@ use crate::{
 use super::{EasyConnectClient, legacy_tls::LegacyTlsStream};
 
 const TUNNEL_BUFFER_SIZE: usize = 256 * 1024;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// The gateway rejects an IP request that follows the token request too
+/// closely; the official flow waits at least one second between them.
+const TOKEN_TO_IP_DELAY: Duration = Duration::from_secs(1);
+const MAX_TUNNEL_RETRIES: u32 = 5;
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 impl EasyConnectClient {
     /// Establish the token exchange and negotiate the L3 virtual IPv4 address.
@@ -27,23 +34,31 @@ impl EasyConnectClient {
     /// Returns an I/O, TLS, or gateway protocol error. Authentication must have
     /// completed successfully before calling this method.
     pub async fn establish_data_plane(&mut self) -> Result<Ipv4Addr, Error> {
-        let token = self.request_token().await?;
+        let token = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.request_token())
+            .await
+            .map_err(|_| Error::Protocol("EasyConnect token request timed out".into()))??;
         self.token = Some(token);
+        tokio::time::sleep(TOKEN_TO_IP_DELAY).await;
 
-        let mut connection = LegacyTlsStream::connect(&self.config.server_host()).await?;
-        let mut request = Vec::with_capacity(64);
-        request.extend_from_slice(&[0, 0, 0, 0]);
-        request.extend_from_slice(&token);
-        request.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
-        connection.write_all(&request).await?;
-        let reply = connection.read_record().await?;
-        if reply.len() < 8 || reply[0] != 0 {
-            return Err(Error::Protocol(format!(
-                "unexpected EasyConnect IP reply: {}",
-                hex::encode(reply)
-            )));
-        }
-        let ip = Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]);
+        let request_ip = async {
+            let mut connection = LegacyTlsStream::connect(&self.config.server_host()).await?;
+            let mut request = Vec::with_capacity(64);
+            request.extend_from_slice(&[0, 0, 0, 0]);
+            request.extend_from_slice(&token);
+            request.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+            connection.write_all(&request).await?;
+            let reply = connection.read_record().await?;
+            if reply.len() < 8 || reply[0] != 0 {
+                return Err(Error::Protocol(format!(
+                    "unexpected EasyConnect IP reply: {}",
+                    hex::encode(reply)
+                )));
+            }
+            Ok((Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]), connection))
+        };
+        let (ip, connection) = tokio::time::timeout(HANDSHAKE_TIMEOUT, request_ip)
+            .await
+            .map_err(|_| Error::Protocol("EasyConnect IP negotiation timed out".into()))??;
         self.client_ip = Some(ip);
         // The server uses the lifetime of this connection as part of the session.
         self.request_ip_connection = Some(connection);
@@ -104,40 +119,21 @@ impl EasyConnectClient {
         Ok(token)
     }
 
-    async fn tunnel_connection(&self, command: u8) -> Result<LegacyTlsStream, Error> {
-        let token = self.token.ok_or(Error::NotConnected)?;
-        let ip = self.client_ip.ok_or(Error::NotConnected)?.octets();
-        let mut connection = LegacyTlsStream::connect(&self.config.server_host()).await?;
-        let mut request = Vec::with_capacity(64);
-        request.extend_from_slice(&[command, 0, 0, 0]);
-        request.extend_from_slice(&token);
-        request.extend_from_slice(&[0; 8]);
-        request.extend(ip.into_iter().rev());
-        connection.write_all(&request).await?;
-        let reply = connection.read_record().await?;
-        let expected = if command == 0x05 { 0x02 } else { 0x01 };
-        if reply.first() != Some(&expected) {
-            let detail = match reply.first() {
-                Some(0x08) => "server shut down the session".to_owned(),
-                Some(code @ (0x05 | 0x06 | 0x07 | 0x09)) => {
-                    format!("server requested reconnect later (0x{code:02x})")
-                }
-                Some(code) => format!("unexpected reply 0x{code:02x}"),
-                None => "empty reply".to_owned(),
-            };
-            return Err(Error::Protocol(format!(
-                "EasyConnect tunnel handshake failed: {detail}"
-            )));
-        }
-        Ok(connection)
+    fn tunnel_session(&self) -> Result<TunnelSession, Error> {
+        Ok(TunnelSession {
+            server_host: self.config.server_host(),
+            token: self.token.ok_or(Error::NotConnected)?,
+            client_ip: self.client_ip.ok_or(Error::NotConnected)?,
+        })
     }
 
     async fn create_l3_stream(&self) -> Result<L3Stream, Error> {
-        let send = self.tunnel_connection(0x05).await?;
-        let receive = self.tunnel_connection(0x06).await?;
+        let session = Arc::new(self.tunnel_session()?);
+        let send = tunnel_connection(&session, 0x05).await?;
+        let receive = tunnel_connection(&session, 0x06).await?;
         let (application, bridge) = tokio::io::duplex(TUNNEL_BUFFER_SIZE);
         tokio::spawn(async move {
-            if let Err(error) = bridge_tunnel(bridge, send, receive).await {
+            if let Err(error) = bridge_tunnel(bridge, session, send, receive).await {
                 tracing::warn!(%error, "EasyConnect L3 tunnel stopped");
             }
         });
@@ -222,25 +218,82 @@ impl VpnClient for EasyConnectClient {
     }
 }
 
+struct TunnelSession {
+    server_host: String,
+    token: [u8; 48],
+    client_ip: Ipv4Addr,
+}
+
+async fn tunnel_connection(
+    session: &TunnelSession,
+    command: u8,
+) -> Result<LegacyTlsStream, Error> {
+    let handshake = async {
+        let mut connection = LegacyTlsStream::connect(&session.server_host).await?;
+        let mut request = Vec::with_capacity(64);
+        request.extend_from_slice(&[command, 0, 0, 0]);
+        request.extend_from_slice(&session.token);
+        request.extend_from_slice(&[0; 8]);
+        request.extend(session.client_ip.octets().into_iter().rev());
+        connection.write_all(&request).await?;
+        let reply = connection.read_record().await?;
+        let expected = if command == 0x05 { 0x02 } else { 0x01 };
+        if reply.first() != Some(&expected) {
+            let detail = match reply.first() {
+                Some(0x08) => "server shut down the session".to_owned(),
+                Some(code @ (0x05 | 0x06 | 0x07 | 0x09)) => {
+                    format!("server requested reconnect later (0x{code:02x})")
+                }
+                Some(code) => format!("unexpected reply 0x{code:02x}"),
+                None => "empty reply".to_owned(),
+            };
+            return Err(Error::Protocol(format!(
+                "EasyConnect tunnel handshake failed: {detail}"
+            )));
+        }
+        Ok(connection)
+    };
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .map_err(|_| Error::Protocol("EasyConnect tunnel handshake timed out".into()))?
+}
+
 async fn bridge_tunnel(
     bridge: DuplexStream,
-    mut send: LegacyTlsStream,
-    mut receive: LegacyTlsStream,
+    session: Arc<TunnelSession>,
+    send: LegacyTlsStream,
+    receive: LegacyTlsStream,
 ) -> Result<(), Error> {
     let (mut from_application, mut to_application) = tokio::io::split(bridge);
     let send_loop = async {
+        let mut connection = send;
+        let mut failures = 0_u32;
         loop {
             let packet = read_ip_packet(&mut from_application).await?;
-            send.write_all(&packet).await?;
+            while let Err(error) = connection.write_all(&packet).await {
+                connection =
+                    reconnect_tunnel(&session, 0x05, &error, &mut failures, "send").await?;
+            }
+            failures = 0;
         }
         #[allow(unreachable_code)]
         Ok::<(), Error>(())
     };
     let receive_loop = async {
+        let mut connection = receive;
+        let mut failures = 0_u32;
         loop {
-            let packet_bytes = receive.read_record().await?;
-            to_application.write_all(&packet_bytes).await?;
-            to_application.flush().await?;
+            match connection.read_record().await {
+                Ok(packet_bytes) => {
+                    failures = 0;
+                    to_application.write_all(&packet_bytes).await?;
+                    to_application.flush().await?;
+                }
+                Err(error) => {
+                    connection =
+                        reconnect_tunnel(&session, 0x06, &error, &mut failures, "receive").await?;
+                }
+            }
         }
         #[allow(unreachable_code)]
         Ok::<(), Error>(())
@@ -248,6 +301,38 @@ async fn bridge_tunnel(
     tokio::select! {
         result = send_loop => result,
         result = receive_loop => result,
+    }
+}
+
+/// Recreate one tunnel direction after `error`, giving up once
+/// [`MAX_TUNNEL_RETRIES`] consecutive attempts have failed.
+async fn reconnect_tunnel(
+    session: &TunnelSession,
+    command: u8,
+    error: &Error,
+    failures: &mut u32,
+    direction: &str,
+) -> Result<LegacyTlsStream, Error> {
+    loop {
+        *failures += 1;
+        if *failures > MAX_TUNNEL_RETRIES {
+            return Err(Error::Protocol(format!(
+                "EasyConnect {direction} tunnel failed after {MAX_TUNNEL_RETRIES} reconnect attempts: {error}"
+            )));
+        }
+        tracing::warn!(
+            %error,
+            direction,
+            attempt = *failures,
+            "EasyConnect tunnel connection failed; reconnecting"
+        );
+        tokio::time::sleep(RECONNECT_DELAY).await;
+        match tunnel_connection(session, command).await {
+            Ok(connection) => return Ok(connection),
+            Err(retry_error) => {
+                tracing::warn!(%retry_error, direction, "EasyConnect tunnel reconnect failed");
+            }
+        }
     }
 }
 
@@ -274,11 +359,8 @@ async fn read_ip_packet(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>
             )));
         }
     };
-    if length > u16::MAX as usize {
-        return Err(Error::Protocol(format!(
-            "IP packet length {length} exceeds 65535"
-        )));
-    }
+    // Both arms are bounded by their u16 length fields: at most 65535 for
+    // IPv4 and 40 + 65535 for IPv6.
     let prefix_length = if prefix[0] >> 4 == 4 { 4 } else { 6 };
     let mut packet = vec![0_u8; length];
     packet[..prefix_length].copy_from_slice(&prefix[..prefix_length]);

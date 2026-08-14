@@ -39,6 +39,20 @@ pub struct ConnectionInfo {
     pub resources: Resources,
 }
 
+/// Resolve once the process receives SIGINT (Ctrl-C) or SIGTERM.
+///
+/// # Errors
+///
+/// Returns an I/O error if a signal handler cannot be registered.
+pub async fn shutdown_signal() -> Result<(), Error> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = terminate.recv() => {}
+    }
+    Ok(())
+}
+
 /// Prompts which a VPN server can issue during authentication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Challenge {

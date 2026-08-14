@@ -268,7 +268,7 @@ async fn connect_atrust(config: Config, control_plane_only: bool) -> Result<(), 
             "aTrust currently requires a SOCKS5 or HTTP proxy listener".into(),
         ));
     }
-    serve_proxies(
+    let proxies = serve_proxies(
         ProxyConfig {
             socks_bind: config.socks_bind,
             socks_username: config.socks_user,
@@ -276,8 +276,11 @@ async fn connect_atrust(config: Config, control_plane_only: bool) -> Result<(), 
             http_bind: config.http_bind,
         },
         Arc::new(client),
-    )
-    .await
+    );
+    tokio::select! {
+        result = proxies => result,
+        result = zju_connect::shutdown_signal() => result,
+    }
 }
 
 async fn run_atrust_tun_services(
@@ -306,11 +309,13 @@ async fn run_atrust_tun_services(
     } else {
         Vec::new()
     };
+    let exclude = gateway_exclusions(&config).await;
     let l3 = client.open_l3().await?;
     let tun = create_tun(
         client_ip,
         TunOptions {
             routes,
+            exclude,
             ..TunOptions::default()
         },
     )
@@ -345,6 +350,37 @@ async fn run_atrust_tun_services(
     };
     client.close().await?;
     result
+}
+
+/// Resolve the gateway addresses that must bypass the TUN, so the outer VPN
+/// transport is never routed back through the tunnel it depends on.
+async fn gateway_exclusions(config: &Config) -> Vec<std::net::IpAddr> {
+    if let Ok(address) = config.server_address.parse::<std::net::IpAddr>() {
+        return vec![address];
+    }
+    match tokio::net::lookup_host((config.server_address.as_str(), config.server_port)).await {
+        Ok(addresses) => {
+            let mut resolved: Vec<std::net::IpAddr> =
+                addresses.map(|socket| socket.ip()).collect();
+            resolved.sort_unstable();
+            resolved.dedup();
+            if resolved.is_empty() {
+                tracing::warn!(
+                    server = %config.server_address,
+                    "gateway address resolved to nothing; skipping route exclusion"
+                );
+            }
+            resolved
+        }
+        Err(error) => {
+            tracing::warn!(
+                server = %config.server_address,
+                %error,
+                "could not resolve gateway address for route exclusion"
+            );
+            Vec::new()
+        }
+    }
 }
 
 fn configured_remote_dns(config: &Config, info: &ConnectionInfo) -> Option<std::net::IpAddr> {
@@ -429,11 +465,13 @@ async fn run_easyconnect_services(
     } else {
         vec!["10.0.0.0/8".parse().expect("valid constant")]
     };
+    let exclude = gateway_exclusions(&config).await;
     let l3 = client.open_l3().await?;
     let tun = create_tun(
         client_ip,
         TunOptions {
             routes,
+            exclude,
             ..TunOptions::default()
         },
     )

@@ -26,6 +26,10 @@ use crate::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HTTP_HEADER: usize = 32 * 1024;
+/// Bound on how long a client may take to complete the proxy handshake before
+/// its task and socket are reclaimed.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 pub trait ProxyIo: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -161,7 +165,9 @@ async fn serve_socks(
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(bind, "SOCKS5 proxy is listening");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let Some((stream, peer)) = accept(&listener).await else {
+            continue;
+        };
         let connector = Arc::clone(&connector);
         let username = username.clone();
         let password = password.clone();
@@ -173,12 +179,55 @@ async fn serve_socks(
     }
 }
 
+/// Accept one connection, tolerating transient per-socket and descriptor
+/// exhaustion errors so a single failure never terminates the daemon.
+async fn accept(listener: &TcpListener) -> Option<(TcpStream, SocketAddr)> {
+    match listener.accept().await {
+        Ok(pair) => Some(pair),
+        Err(error) => {
+            match error.raw_os_error() {
+                // ECONNABORTED — client vanished mid-handshake.
+                Some(103) => {}
+                // EMFILE/ENFILE — out of descriptors; back off so we don't spin.
+                Some(24 | 23) => {
+                    tracing::warn!(%error, "accept hit a descriptor limit; backing off");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                }
+                _ => tracing::warn!(%error, "transient accept error"),
+            }
+            None
+        }
+    }
+}
+
 async fn handle_socks(
     mut client: TcpStream,
     connector: Arc<dyn TcpConnector>,
     username: &str,
     password: &str,
 ) -> Result<(), Error> {
+    let negotiate = socks_negotiate(&mut client, username, password);
+    let (host, port) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, negotiate).await {
+        Ok(result) => result?,
+        Err(_) => return Err(Error::Protocol("SOCKS handshake timed out".into())),
+    };
+    let mut upstream = match connector.connect_tcp(&host, port).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            send_socks_reply(&mut client, socks_error_code(&error)).await?;
+            return Err(error);
+        }
+    };
+    send_socks_reply(&mut client, 0).await?;
+    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok(())
+}
+
+async fn socks_negotiate(
+    client: &mut TcpStream,
+    username: &str,
+    password: &str,
+) -> Result<(String, u16), Error> {
     let version = client.read_u8().await?;
     let method_count = client.read_u8().await?;
     if version != 5 {
@@ -195,15 +244,19 @@ async fn handle_socks(
     }
     client.write_all(&[5, required_method]).await?;
     if required_method == 0x02 {
-        authenticate_socks(&mut client, username, password).await?;
+        authenticate_socks(client, username, password).await?;
     }
 
     let version = client.read_u8().await?;
     let command = client.read_u8().await?;
     let _reserved = client.read_u8().await?;
     let address_type = client.read_u8().await?;
-    if version != 5 || command != 1 {
-        send_socks_reply(&mut client, 0x07).await?;
+    if version != 5 {
+        send_socks_reply(client, 0x01).await?;
+        return Err(Error::Protocol("invalid SOCKS version".into()));
+    }
+    if command != 1 {
+        send_socks_reply(client, 0x07).await?;
         return Err(Error::Protocol("only SOCKS5 CONNECT is supported".into()));
     }
     let host = match address_type {
@@ -225,21 +278,27 @@ async fn handle_socks(
             Ipv6Addr::from(address).to_string()
         }
         _ => {
-            send_socks_reply(&mut client, 0x08).await?;
+            send_socks_reply(client, 0x08).await?;
             return Err(Error::Protocol("invalid SOCKS address type".into()));
         }
     };
     let port = client.read_u16().await?;
-    let mut upstream = match connector.connect_tcp(&host, port).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            send_socks_reply(&mut client, 0x05).await?;
-            return Err(error);
-        }
-    };
-    send_socks_reply(&mut client, 0).await?;
-    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
-    Ok(())
+    Ok((host, port))
+}
+
+/// Map a connection failure to the closest SOCKS5 reply code.
+fn socks_error_code(error: &Error) -> u8 {
+    match error {
+        Error::Io(io) => match io.kind() {
+            std::io::ErrorKind::ConnectionRefused => 0x05,
+            std::io::ErrorKind::TimedOut => 0x06,
+            std::io::ErrorKind::HostUnreachable => 0x04,
+            std::io::ErrorKind::NetworkUnreachable => 0x03,
+            _ => 0x01,
+        },
+        // Policy denial, DNS failure, route installation.
+        _ => 0x01,
+    }
 }
 
 async fn authenticate_socks(
@@ -281,7 +340,9 @@ async fn serve_http(bind: &str, connector: Arc<dyn TcpConnector>) -> Result<(), 
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(bind, "HTTP proxy is listening");
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let Some((stream, peer)) = accept(&listener).await else {
+            continue;
+        };
         let connector = Arc::clone(&connector);
         tokio::spawn(async move {
             if let Err(error) = handle_http(stream, connector).await {
@@ -293,17 +354,23 @@ async fn serve_http(bind: &str, connector: Arc<dyn TcpConnector>) -> Result<(), 
 
 async fn handle_http(mut client: TcpStream, connector: Arc<dyn TcpConnector>) -> Result<(), Error> {
     let mut request = Vec::with_capacity(1024);
-    let header_end = loop {
-        if request.len() >= MAX_HTTP_HEADER {
-            return Err(Error::Protocol("HTTP proxy header is too large".into()));
+    let read_header = async {
+        loop {
+            if request.len() >= MAX_HTTP_HEADER {
+                return Err(Error::Protocol("HTTP proxy header is too large".into()));
+            }
+            let read = client.read_buf(&mut request).await?;
+            if read == 0 {
+                return Err(Error::Protocol("incomplete HTTP proxy request".into()));
+            }
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                return Ok(position + 4);
+            }
         }
-        let read = client.read_buf(&mut request).await?;
-        if read == 0 {
-            return Err(Error::Protocol("incomplete HTTP proxy request".into()));
-        }
-        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-            break position + 4;
-        }
+    };
+    let header_end = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_header).await {
+        Ok(result) => result?,
+        Err(_) => return Err(Error::Protocol("HTTP proxy header timed out".into())),
     };
     let header = std::str::from_utf8(&request[..header_end])
         .map_err(|_| Error::Protocol("HTTP proxy header is not UTF-8".into()))?;
@@ -569,6 +636,17 @@ mod tests {
         assert_eq!(&query[..2], &[0x12, 0x34]);
         assert!(query.windows(3).any(|window| window == b"zju"));
         assert_eq!(&query[query.len() - 4..], &[0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn maps_connect_errors_to_socks_codes() {
+        use std::io::ErrorKind;
+        let code = |kind| socks_error_code(&Error::Io(std::io::Error::from(kind)));
+        assert_eq!(code(ErrorKind::ConnectionRefused), 0x05);
+        assert_eq!(code(ErrorKind::TimedOut), 0x06);
+        assert_eq!(code(ErrorKind::HostUnreachable), 0x04);
+        assert_eq!(code(ErrorKind::NetworkUnreachable), 0x03);
+        assert_eq!(socks_error_code(&Error::NotConnected), 0x01);
     }
 
     #[test]

@@ -157,15 +157,7 @@ impl EasyConnectClient {
                 "session keep-alive returned HTTP {status}"
             )));
         }
-        let document = roxmltree::Document::parse(&body)
-            .map_err(|error| Error::Protocol(format!("invalid keep-alive XML: {error}")))?;
-        let value = |name| {
-            document
-                .descendants()
-                .find(|node| node.has_tag_name(name))
-                .and_then(|node| node.text())
-        };
-        if value("Message") != Some("success") || value("ErrorCode") != Some("1") {
+        if !keepalive_body_is_success(&body) {
             return Err(Error::Protocol(format!(
                 "gateway rejected session keep-alive: {body}"
             )));
@@ -254,6 +246,9 @@ impl EasyConnectClient {
         };
         self.keepalive_task = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
+            // After a laptop resume, run one catch-up request instead of a
+            // burst of every missed tick.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
             loop {
                 interval.tick().await;
@@ -269,7 +264,12 @@ impl EasyConnectClient {
                         tracing::debug!("gateway does not support session keep-alive");
                         return;
                     }
-                    Ok(response) if response.status().is_success() => {}
+                    Ok(response) if response.status().is_success() => {
+                        let body = response.text().await.unwrap_or_default();
+                        if !keepalive_body_is_success(&body) {
+                            tracing::warn!(body, "gateway rejected EasyConnect keep-alive");
+                        }
+                    }
                     Ok(response) => {
                         tracing::warn!(status = %response.status(), "EasyConnect keep-alive failed");
                     }
@@ -310,6 +310,19 @@ impl Drop for EasyConnectClient {
     }
 }
 
+fn keepalive_body_is_success(body: &str) -> bool {
+    let Ok(document) = roxmltree::Document::parse(body) else {
+        return false;
+    };
+    let value = |name| {
+        document
+            .descendants()
+            .find(|node| node.has_tag_name(name))
+            .and_then(|node| node.text())
+    };
+    value("Message") == Some("success") && value("ErrorCode") == Some("1")
+}
+
 fn split_host_port(value: &str) -> Result<(String, u16), Error> {
     if let Ok(address) = value.parse::<std::net::SocketAddr>() {
         return Ok((address.ip().to_string(), address.port()));
@@ -321,4 +334,31 @@ fn split_host_port(value: &str) -> Result<(String, u16), Error> {
         .parse()
         .map_err(|_| Error::Protocol(format!("invalid EasyConnect line port: {value}")))?;
     Ok((host.trim_matches(['[', ']']).to_owned(), port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_keepalive_response_body() {
+        let success = "<Auth><Message>success</Message><ErrorCode>1</ErrorCode></Auth>";
+        let failure = "<Auth><Message>failure</Message><ErrorCode>0</ErrorCode></Auth>";
+        assert!(keepalive_body_is_success(success));
+        assert!(!keepalive_body_is_success(failure));
+        assert!(!keepalive_body_is_success("not xml"));
+    }
+
+    #[test]
+    fn splits_line_hosts_and_ports() {
+        assert_eq!(
+            split_host_port("vpn.example.edu:443").unwrap(),
+            ("vpn.example.edu".into(), 443)
+        );
+        assert_eq!(
+            split_host_port("[2001:db8::1]:443").unwrap(),
+            ("2001:db8::1".into(), 443)
+        );
+        assert!(split_host_port("no-port").is_err());
+    }
 }

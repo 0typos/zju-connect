@@ -1,6 +1,9 @@
 //! Operating-system TUN device integration.
 
-use std::{net::Ipv4Addr, process::Stdio};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    process::Stdio,
+};
 
 use ipnet::IpNet;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
@@ -15,6 +18,9 @@ pub struct TunOptions {
     pub name: String,
     pub mtu: u16,
     pub routes: Vec<IpNet>,
+    /// Gateway addresses to pin to the underlay so the tunnel's own transport
+    /// is never routed back into the TUN.
+    pub exclude: Vec<IpAddr>,
 }
 
 pub struct TunSession {
@@ -29,6 +35,7 @@ impl Default for TunOptions {
             name: "zju-connect".into(),
             mtu: DEFAULT_MTU,
             routes: Vec::new(),
+            exclude: Vec::new(),
         }
     }
 }
@@ -57,6 +64,11 @@ pub async fn create(client_ip: Ipv4Addr, options: TunOptions) -> Result<TunSessi
     let interface = device
         .tun_name()
         .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+    // Pin the gateway path to the underlay before installing tunnel routes so
+    // the outer VPN transport can never be captured by the TUN.
+    for address in &options.exclude {
+        exclude_route(*address).await;
+    }
     for route in &options.routes {
         add_route(route, &interface).await?;
     }
@@ -110,10 +122,7 @@ impl TunSession {
         tokio::select! {
             result = to_vpn => result,
             result = from_vpn => result,
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                Ok(())
-            }
+            result = crate::shutdown_signal() => result,
         }
     }
 }
@@ -181,6 +190,70 @@ async fn add_route(route: &IpNet, interface: &str) -> Result<(), Error> {
     route_result(&output, route)
 }
 
+/// Pin `address` to its current underlay path as a host route, so it is not
+/// captured by the tunnel routes installed afterward. Best-effort: a failure
+/// is logged rather than fatal, since the address may already be off-tunnel.
+async fn exclude_route(address: IpAddr) {
+    let Some((via, dev)) = underlay_path(address).await else {
+        tracing::debug!(%address, "could not determine underlay path for gateway exclusion");
+        return;
+    };
+    let mut command = tokio::process::Command::new("ip");
+    command
+        .args(["route", "replace"])
+        .arg(format!("{address}/{}", host_prefix(address)));
+    if let Some(via) = &via {
+        command.args(["via", via]);
+    }
+    command.args(["dev", &dev]).stdin(Stdio::null());
+    match command.output().await {
+        Ok(output) if output.status.success() => {
+            tracing::info!(%address, dev, "pinned gateway to the underlay interface");
+        }
+        Ok(output) => tracing::warn!(
+            %address,
+            error = %String::from_utf8_lossy(&output.stderr).trim(),
+            "could not pin gateway route"
+        ),
+        Err(error) => tracing::warn!(%address, %error, "could not run ip route replace"),
+    }
+}
+
+/// Query the kernel for the interface (and optional gateway) that currently
+/// reaches `address`, before any tunnel route can shadow it.
+async fn underlay_path(address: IpAddr) -> Option<(Option<String>, String)> {
+    let output = tokio::process::Command::new("ip")
+        .args(["route", "get"])
+        .arg(address.to_string())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let dev = tokens
+        .iter()
+        .position(|token| *token == "dev")
+        .and_then(|index| tokens.get(index + 1))
+        .map(|dev| (*dev).to_owned())?;
+    let via = tokens
+        .iter()
+        .position(|token| *token == "via")
+        .and_then(|index| tokens.get(index + 1))
+        .map(|via| (*via).to_owned());
+    Some((via, dev))
+}
+
+fn host_prefix(address: IpAddr) -> u8 {
+    match address {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    }
+}
+
 fn route_result(output: &std::process::Output, route: &IpNet) -> Result<(), Error> {
     if output.status.success() {
         Ok(())
@@ -204,5 +277,28 @@ mod tests {
         assert!(validate_ip_packet(&packet).is_ok());
         packet.push(0);
         assert!(validate_ip_packet(&packet).is_err());
+    }
+
+    #[tokio::test]
+    async fn reads_ip_packet_across_fragmented_reads() {
+        let mut packet = vec![0_u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40_u16.to_be_bytes());
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let expected = packet.clone();
+        let sender = tokio::spawn(async move {
+            for chunk in expected.chunks(7) {
+                writer.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        assert_eq!(read_ip_packet(&mut reader).await.unwrap(), packet);
+        sender.await.unwrap();
+    }
+
+    #[test]
+    fn host_prefixes_match_family() {
+        assert_eq!(host_prefix("10.0.0.1".parse().unwrap()), 32);
+        assert_eq!(host_prefix("2001:db8::1".parse().unwrap()), 128);
     }
 }
