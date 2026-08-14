@@ -13,7 +13,8 @@ use zju_connect::{
     tun::{TunOptions, create as create_tun},
 };
 
-#[derive(Debug, Parser)]
+// No Debug derive: the credential fields must never reach a log or panic message.
+#[derive(Parser)]
 #[allow(clippy::struct_excessive_bools)]
 #[command(
     version,

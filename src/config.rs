@@ -12,7 +12,7 @@ pub enum Protocol {
     Atrust,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Config {
@@ -75,6 +75,41 @@ pub struct Config {
     pub custom_proxy_domain: Vec<String>,
     pub custom_dns: Vec<CustomDns>,
     pub port_forwarding: Vec<PortForward>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |value: &str| if value.is_empty() { "\"\"" } else { "\"<redacted>\"" };
+        formatter
+            .debug_struct("Config")
+            .field("protocol", &self.protocol)
+            .field("server_address", &self.server_address)
+            .field("server_port", &self.server_port)
+            .field("username", &self.username)
+            .field("password", &format_args!("{}", redact(&self.password)))
+            .field("totp_secret", &format_args!("{}", redact(&self.totp_secret)))
+            .field("socks_bind", &self.socks_bind)
+            .field("socks_user", &self.socks_user)
+            .field(
+                "socks_password",
+                &format_args!("{}", redact(&self.socks_password)),
+            )
+            .field("http_bind", &self.http_bind)
+            .field("allow_open_proxy", &self.allow_open_proxy)
+            .field("insecure_skip_verify", &self.insecure_skip_verify)
+            .field("tun_mode", &self.tun_mode)
+            .field("add_route", &self.add_route)
+            .field("proxy_all", &self.proxy_all)
+            .field(
+                "sign_key",
+                &self.sign_key.as_deref().map(|_| "<redacted>"),
+            )
+            .field(
+                "cert_password",
+                &format_args!("{}", redact(&self.cert_password)),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Config {
@@ -418,6 +453,21 @@ mod tests {
             ..Config::default()
         };
         acknowledged.validate().unwrap();
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets() {
+        let config = Config {
+            password: "hunter2".into(),
+            totp_secret: "ABCDEF".into(),
+            sign_key: Some("ab".repeat(32)),
+            ..Config::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains("ABCDEF"));
+        assert!(!rendered.contains(&"ab".repeat(32)));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

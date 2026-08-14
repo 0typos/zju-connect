@@ -34,6 +34,7 @@ pub type L3Stream = Pin<Box<dyn AsyncStream>>;
 
 /// Information negotiated while establishing the VPN control plane.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ConnectionInfo {
     pub client_ip: IpAddr,
     pub dns_servers: Vec<IpAddr>,
@@ -80,6 +81,7 @@ pub trait VpnClient: Send {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("invalid configuration: {0}")]
     Config(String),
@@ -95,8 +97,16 @@ pub enum Error {
     NotConnected,
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Http(#[from] reqwest::Error),
+    #[error("HTTP error: {0}")]
+    Http(String),
     #[error("TLS error: {0}")]
     Tls(String),
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(error: reqwest::Error) -> Self {
+        // reqwest is an implementation detail; keep it out of the public API so
+        // its frequent major releases are not breaking changes for this crate.
+        Self::Http(error.to_string())
+    }
 }

@@ -19,6 +19,7 @@ impl ProtocolMatch {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct IpResource {
     pub addresses: IpRange,
     pub ports: RangeInclusive<u16>,
@@ -75,6 +76,7 @@ impl IpRange {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct DomainResource {
     pub ports: RangeInclusive<u16>,
     pub protocol: ProtocolMatch,
@@ -90,6 +92,7 @@ impl DomainResource {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct Resources {
     pub ip: Vec<IpResource>,
     pub domains: BTreeMap<String, Vec<DomainResource>>,
