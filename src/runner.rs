@@ -189,7 +189,9 @@ async fn run_easyconnect(
         result = serve_optional(proxy_enabled, &config, connector) => result,
         () = cancelled(&mut cancel) => Ok(()),
     };
-    client.close().await?;
+    if let Err(error) = client.close().await {
+        tracing::debug!(%error, "error while closing the VPN session");
+    }
     result
 }
 
@@ -257,7 +259,9 @@ async fn run_atrust_tun(
         result = serve_optional(proxy_enabled(&config), &config, connector) => result,
         () = cancelled(&mut cancel) => Ok(()),
     };
-    client.close().await?;
+    if let Err(error) = client.close().await {
+        tracing::debug!(%error, "error while closing the VPN session");
+    }
     result
 }
 

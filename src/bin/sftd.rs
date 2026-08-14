@@ -7,6 +7,7 @@
 use std::{
     path::PathBuf,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use clap::Parser;
@@ -18,10 +19,17 @@ use sangfordetunz::{
     shutdown_signal,
 };
 use tokio::{
-    io::BufReader,
+    io::{AsyncReadExt as _, BufReader},
     net::{UnixListener, UnixStream},
 };
 use tracing_subscriber::EnvFilter;
+
+/// A client that opens a control connection but does not send a complete
+/// request within this window is dropped, so it cannot pin a task forever.
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on a single control request, so a client cannot exhaust memory
+/// by streaming an unterminated line.
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 #[derive(Parser)]
 #[command(version, about = "sangfordetunz VPN daemon")]
@@ -72,11 +80,18 @@ async fn run() -> Result<(), Error> {
 
     autostart(&daemon);
 
-    // Remove a stale socket from a previous run before binding.
-    let _ = std::fs::remove_file(&socket_path);
+    // Refuse to start if another daemon is already listening, so we never
+    // unlink a live daemon's socket. A failed connect means the socket is
+    // stale (or absent) and safe to remove.
+    if UnixStream::connect(&socket_path).await.is_ok() {
+        return Err(Error::Config(format!(
+            "another sftd is already listening on {socket_path}"
+        )));
+    }
     if let Some(parent) = std::path::Path::new(&socket_path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
     tracing::info!(socket = %socket_path, "sftd is listening for client commands");
 
@@ -128,11 +143,14 @@ async fn accept_loop(listener: &UnixListener, daemon: &Arc<Daemon>) -> Result<()
 
 async fn serve_client(stream: UnixStream, daemon: &Arc<Daemon>) {
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    let response = match control::read_request(&mut reader).await {
-        Ok(Some(request)) => dispatch(request, daemon).await,
-        Ok(None) => return,
-        Err(error) => Response::error(error.to_string()),
+    // Bound the request size and the time allowed to send it.
+    let mut reader = BufReader::new(read_half.take(MAX_REQUEST_BYTES));
+    let read = tokio::time::timeout(CONTROL_READ_TIMEOUT, control::read_request(&mut reader)).await;
+    let response = match read {
+        Ok(Ok(Some(request))) => dispatch(request, daemon).await,
+        Ok(Ok(None)) => return,
+        Ok(Err(error)) => Response::error(error.to_string()),
+        Err(_) => Response::error("control request timed out"),
     };
     if let Err(error) = control::write_response(&mut write_half, &response).await {
         tracing::debug!(%error, "could not send control response");

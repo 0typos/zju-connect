@@ -9,7 +9,10 @@ use std::{
     collections::BTreeMap,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -30,15 +33,36 @@ type RunFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
 pub type Runner = Arc<dyn Fn(Config, String, Cancel, StatusHandle) -> RunFuture + Send + Sync>;
 
 struct ManagedConnection {
+    /// Distinguishes this connection from a later one reusing the same name.
+    id: u64,
     cancel: watch::Sender<bool>,
     status: StatusHandle,
-    handle: JoinHandle<()>,
+    /// Taken by `down` so it can await teardown while the name stays reserved.
+    handle: Option<JoinHandle<()>>,
+    stopping: bool,
     started: SystemTime,
+}
+
+impl ManagedConnection {
+    /// Whether this connection still owns its resources (TUN interface, ports).
+    /// A stopping, finished, or terminal-state connection does not.
+    fn is_live(&self) -> bool {
+        !self.stopping
+            && self
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+            && matches!(
+                self.status.get(),
+                ConnectionState::Connecting | ConnectionState::Connected { .. }
+            )
+    }
 }
 
 /// Owns the set of active connections and mediates control commands.
 pub struct ConnectionManager {
     connections: Mutex<BTreeMap<String, ManagedConnection>>,
+    next_id: AtomicU64,
     runner: Runner,
 }
 
@@ -47,6 +71,7 @@ impl ConnectionManager {
     pub fn new(runner: Runner) -> Self {
         Self {
             connections: Mutex::new(BTreeMap::new()),
+            next_id: AtomicU64::new(0),
             runner,
         }
     }
@@ -76,15 +101,15 @@ impl ConnectionManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = connections.get(name) {
-            match existing.status.get() {
-                ConnectionState::Connecting | ConnectionState::Connected { .. } => {
-                    return Err(Error::Config(format!("{name} is already up")));
-                }
-                // A finished connection lingers only for status; replace it.
-                ConnectionState::Down | ConnectionState::Failed { .. } => {
-                    connections.remove(name);
-                }
+            if existing.stopping {
+                return Err(Error::Config(format!("{name} is still shutting down")));
             }
+            if existing.is_live() {
+                return Err(Error::Config(format!("{name} is already up")));
+            }
+            // A finished or dead (even panicked) connection lingers only for
+            // status; replace it.
+            connections.remove(name);
         }
 
         let status = StatusHandle::new();
@@ -108,9 +133,11 @@ impl ConnectionManager {
         connections.insert(
             name.to_owned(),
             ManagedConnection {
+                id: self.next_id.fetch_add(1, Ordering::Relaxed),
                 cancel: cancel_tx,
                 status,
-                handle,
+                handle: Some(handle),
+                stopping: false,
                 started: SystemTime::now(),
             },
         );
@@ -123,25 +150,42 @@ impl ConnectionManager {
     ///
     /// Returns [`Error::Config`] if no connection for `name` is running.
     pub async fn down(&self, name: &str) -> Result<(), Error> {
-        let connection = self
+        // Signal cancellation and take the join handle, but leave the entry in
+        // the map (marked `stopping`) so the name stays reserved until teardown
+        // finishes — otherwise a racing `up` could rebind the same TUN
+        // interface or proxy port while the old task still holds it.
+        let (id, handle) = {
+            let mut connections = self
+                .connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(connection) = connections.get_mut(name) else {
+                return Err(Error::Config(format!("{name} is not running")));
+            };
+            connection.stopping = true;
+            let _ = connection.cancel.send(true);
+            (connection.id, connection.handle.take())
+        };
+
+        if let Some(handle) = handle {
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(SHUTDOWN_GRACE, handle).await.is_err() {
+                tracing::warn!(
+                    name,
+                    "connection did not stop within grace period; aborting"
+                );
+                abort.abort();
+            }
+        }
+
+        // Remove the entry only if it is still the one we tore down; a
+        // concurrent `up` after a self-finish may have replaced it.
+        let mut connections = self
             .connections
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(name);
-        let Some(connection) = connection else {
-            return Err(Error::Config(format!("{name} is not running")));
-        };
-        let _ = connection.cancel.send(true);
-        let abort = connection.handle.abort_handle();
-        if tokio::time::timeout(SHUTDOWN_GRACE, connection.handle)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                name,
-                "connection did not stop within grace period; aborting"
-            );
-            abort.abort();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if connections.get(name).is_some_and(|entry| entry.id == id) {
+            connections.remove(name);
         }
         Ok(())
     }
@@ -170,30 +214,45 @@ impl ConnectionManager {
         connections
             .iter()
             .filter(|(key, _)| name.is_none_or(|wanted| wanted == key.as_str()))
-            .map(|(profile, connection)| ConnectionStatus {
-                profile: profile.clone(),
-                state: connection.status.get(),
-                uptime_seconds: connection
-                    .started
-                    .elapsed()
-                    .map_or(0, |elapsed| elapsed.as_secs()),
+            .map(|(profile, connection)| {
+                let mut state = connection.status.get();
+                // A finished handle still reporting Connecting/Connected means
+                // the task ended abnormally (e.g. panicked) without recording a
+                // terminal state; report that honestly.
+                let finished = connection
+                    .handle
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished);
+                if finished
+                    && matches!(
+                        state,
+                        ConnectionState::Connecting | ConnectionState::Connected { .. }
+                    )
+                {
+                    state = ConnectionState::Failed {
+                        error: "connection task ended unexpectedly".into(),
+                    };
+                }
+                ConnectionStatus {
+                    profile: profile.clone(),
+                    state,
+                    uptime_seconds: connection
+                        .started
+                        .elapsed()
+                        .map_or(0, |elapsed| elapsed.as_secs()),
+                }
             })
             .collect()
     }
 
-    /// Whether a connection for `name` is currently connecting or connected.
+    /// Whether a connection for `name` currently owns its resources.
     #[must_use]
     pub fn is_active(&self, name: &str) -> bool {
         self.connections
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(name)
-            .is_some_and(|connection| {
-                matches!(
-                    connection.status.get(),
-                    ConnectionState::Connecting | ConnectionState::Connected { .. }
-                )
-            })
+            .is_some_and(ManagedConnection::is_live)
     }
 }
 
@@ -239,6 +298,56 @@ mod tests {
         manager.down("zju").await.unwrap();
         assert!(manager.status(None).is_empty());
         assert!(manager.down("zju").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn up_is_rejected_while_a_profile_is_shutting_down() {
+        // The runner blocks in teardown until released, so we can observe the
+        // stopping window deterministically.
+        let (release_tx, release_rx) = watch::channel(false);
+        let runner: Runner = Arc::new(move |_config, _profile, mut cancel, status| {
+            let mut release = release_rx.clone();
+            Box::pin(async move {
+                status.set(ConnectionState::Connected {
+                    client_ip: "10.0.0.1".parse().unwrap(),
+                });
+                let _ = cancel.wait_for(|stop| *stop).await;
+                let _ = release.wait_for(|released| *released).await;
+                Ok(())
+            })
+        });
+        let manager = Arc::new(ConnectionManager::new(runner));
+        manager.up("zju", Config::default()).unwrap();
+        for _ in 0..1000 {
+            if manager.is_active("zju") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let stopper = Arc::clone(&manager);
+        let down = tokio::spawn(async move { stopper.down("zju").await });
+
+        // Once `down` marks the entry stopping, `up` must be refused and must
+        // never rebind the name until teardown finishes.
+        let mut refused_during_teardown = false;
+        for _ in 0..1000 {
+            match manager.up("zju", Config::default()) {
+                Ok(()) => panic!("up must not rebind a profile mid-teardown"),
+                Err(error) if error.to_string().contains("shutting down") => {
+                    refused_during_teardown = true;
+                    break;
+                }
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+        assert!(refused_during_teardown);
+
+        release_tx.send(true).unwrap();
+        down.await.unwrap().unwrap();
+
+        // After teardown the name is free again.
+        manager.up("zju", Config::default()).unwrap();
     }
 
     #[tokio::test]
